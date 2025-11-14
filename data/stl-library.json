@@ -1,0 +1,74 @@
+[
+  {
+    "id": "benchy",
+    "nombre": "Benchy",
+    "descripcion": "Barquito de prueba estándar para calibrar la impresora 3D.",
+    "categoria": "Test de calibración",
+    "dificultad": "media",
+    "tags": ["test", "calibracion", "barco"],
+    "archivo": "stl/Benchy.stl"
+  },
+  {
+    "id": "calabaza-halloween",
+    "nombre": "Calabaza de Halloween",
+    "descripcion": "Calabaza decorativa hueca para Halloween o fiestas temáticas.",
+    "categoria": "Decoración",
+    "dificultad": "media",
+    "tags": ["halloween", "decoracion", "calabaza"],
+    "archivo": "stl/calabaza-halloween.stl"
+  },
+  {
+    "id": "colgador-tazas",
+    "nombre": "Colgador para tazas",
+    "descripcion": "Soporte para colgar tazas y organizar la cocina.",
+    "categoria": "Organización",
+    "dificultad": "media",
+    "tags": ["cocina", "organizacion", "tazas"],
+    "archivo": "stl/colgador-tazas.stl"
+  },
+  {
+    "id": "dragon",
+    "nombre": "Dragón decorativo",
+    "descripcion": "Figura de dragón para decoración o exhibición.",
+    "categoria": "Figuras",
+    "dificultad": "difícil",
+    "tags": ["dragon", "figura", "decoracion"],
+    "archivo": "stl/dragon.stl"
+  },
+  {
+    "id": "pikachu",
+    "nombre": "Pikachu",
+    "descripcion": "Figura de Pikachu estilo muñeco coleccionable.",
+    "categoria": "Juguetes",
+    "dificultad": "media",
+    "tags": ["pikachu", "juguete", "figura"],
+    "archivo": "stl/pikachu.STL"
+  },
+  {
+    "id": "porta-pilas",
+    "nombre": "Porta pilas",
+    "descripcion": "Soporte para organizar y guardar pilas.",
+    "categoria": "Organización",
+    "dificultad": "fácil",
+    "tags": ["pilas", "organizacion", "soporte"],
+    "archivo": "stl/porta-pilas.stl"
+  },
+  {
+    "id": "portahuevo-angry-bird",
+    "nombre": "Portahuevo Angry Bird",
+    "descripcion": "Portahuevo con diseño inspirado en Angry Birds.",
+    "categoria": "Cocina",
+    "dificultad": "media",
+    "tags": ["huevo", "angry-bird", "cocina"],
+    "archivo": "stl/portahuevo-Angry_Bird.STL"
+  },
+  {
+    "id": "vaso-portalapices-multiuso",
+    "nombre": "Vaso porta lápices multiuso",
+    "descripcion": "Vaso organizador para lápices, herramientas o accesorios.",
+    "categoria": "Escritorio",
+    "dificultad": "fácil",
+    "tags": ["escritorio", "lapices", "organizador"],
+    "archivo": "stl/vaso-portalapices-multiuso.stl"
+  }
+]
