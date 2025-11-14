@@ -74,6 +74,17 @@ if (globalThis.__OPPI_STARTED__) {
     while (t.length > MAX_TURNS) t.shift();
   }
 
+const express = require("express");
+const app = express();
+
+app.use(express.json()); // importante para leer req.body JSON
+
+const stlRouter = require("./routes/stl");
+app.use("/api/stl", stlRouter);
+
+// ...el resto de tu configuración (puerto, otras rutas, etc.)
+
+
   // ========================================================================
   // Helpers varios
   // ========================================================================
@@ -383,3 +394,4 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
