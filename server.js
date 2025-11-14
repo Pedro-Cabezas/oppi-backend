@@ -134,30 +134,69 @@ if (globalThis.__OPPI_STARTED__) {
     return stlLibraryCache;
   }
 
+   // Normalizar: minúsculas + sin tildes
+  function normalize(str = "") {
+    return String(str)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, ""); // saca acentos
+  }
+
+  const STOPWORDS = new Set([
+    "el","la","los","las","un","una","unos","unas",
+    "de","del","para","por","con","y","o","u","en","a",
+    "mi","tu","su","sus","quiero","necesito","modelo","simple",
+    "probar","prueba","imprimir","imprime","algo","un","una"
+  ]);
+
   function scoreStlModel(model, query) {
-    const text = (
+    const text = normalize(
       (model.nombre || "") + " " +
       (model.descripcion || "") + " " +
       (model.categoria || "") + " " +
       (Array.isArray(model.tags) ? model.tags.join(" ") : "")
-    ).toLowerCase();
+    );
 
-    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const words = normalize(query)
+      .split(/\s+/)
+      .filter(w => w && !STOPWORDS.has(w) && w.length >= 3);
+
+    if (!words.length) return 0;
+
     let score = 0;
+
     for (const w of words) {
-      if (text.includes(w)) score++;
+      if (text.includes(w)) score += 2; // match general
     }
+
+    // Bonus: matches en tags exactos o casi exactos
+    const tags = (model.tags || []).map(t => normalize(t));
+    for (const w of words) {
+      if (tags.includes(w)) score += 3;                // match exacto
+      else if (tags.some(t => t.includes(w))) score++; // match parcial
+    }
+
     return score;
   }
 
   async function findBestStl(query) {
     const library = await loadStlLibrary();
+    if (!library.length) return null;
+
     const scored = library
       .map(m => ({ ...m, score: scoreStlModel(m, query) }))
       .filter(m => m.score > 0)
       .sort((a, b) => b.score - a.score);
-    return scored[0] || null;
+
+    // Si nada tiene score > 0, devolvemos Benchy como modelo de test
+    if (!scored.length) {
+      const benchy = library.find(m => m.id === "benchy") || library[0];
+      return benchy;
+    }
+
+    return scored[0];
   }
+
 
   
   async function writeTmpIni(iniText) {
@@ -453,6 +492,7 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
 
 
 
