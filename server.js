@@ -116,6 +116,50 @@ if (globalThis.__OPPI_STARTED__) {
     return lines.join("\n");
   }
 
+  // ========================================================================
+  // Biblioteca STL: cargar JSON y buscar mejor modelo
+  // ========================================================================
+  let stlLibraryCache = null;
+
+  async function loadStlLibrary() {
+    if (stlLibraryCache) return stlLibraryCache;
+    try {
+      const stlPath = path.join(process.cwd(), "data", "stl-library.json");
+      const raw = await fs.readFile(stlPath, "utf8");
+      stlLibraryCache = JSON.parse(raw);
+    } catch (e) {
+      console.error("❌ Error cargando stl-library.json:", e);
+      stlLibraryCache = [];
+    }
+    return stlLibraryCache;
+  }
+
+  function scoreStlModel(model, query) {
+    const text = (
+      (model.nombre || "") + " " +
+      (model.descripcion || "") + " " +
+      (model.categoria || "") + " " +
+      (Array.isArray(model.tags) ? model.tags.join(" ") : "")
+    ).toLowerCase();
+
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    let score = 0;
+    for (const w of words) {
+      if (text.includes(w)) score++;
+    }
+    return score;
+  }
+
+  async function findBestStl(query) {
+    const library = await loadStlLibrary();
+    const scored = library
+      .map(m => ({ ...m, score: scoreStlModel(m, query) }))
+      .filter(m => m.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored[0] || null;
+  }
+
+  
   async function writeTmpIni(iniText) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
     const file = path.join(dir, "oppi-profile.prusa.ini");
@@ -294,6 +338,30 @@ if (globalThis.__OPPI_STARTED__) {
     res.json({ ok: true });
   });
 
+    // Sugerir STL en base a un texto
+  app.post("/api/stl/suggest", async (req, res) => {
+    try {
+      const { prompt } = req.body || {};
+      if (!prompt || !prompt.trim()) {
+        return res.status(400).json({ error: "Falta el texto de búsqueda (prompt)." });
+      }
+
+      const best = await findBestStl(prompt);
+      if (!best) {
+        return res.json({ found: false });
+      }
+
+      return res.json({
+        found: true,
+        model: best
+      });
+    } catch (e) {
+      console.error("❌ Error en /api/stl/suggest:", e);
+      res.status(500).json({ error: "No pude buscar un modelo STL." });
+    }
+  });
+
+
   // Importar .ini (para usar como contexto)
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
   app.post("/import-ini", upload.single("file"), async (req, res) => {
@@ -385,5 +453,6 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
 
 
