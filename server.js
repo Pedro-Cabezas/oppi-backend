@@ -1,7 +1,12 @@
 // ============================================================================
-// Oppi Backend v2 — Reescritura total (compatible con @google/genai 1.4.0)
-// Autor: ChatGPT + Pedro
+// Oppi Backend — Chat + Memoria + Import/Generar .ini + STL
+// Versión: GoogleGenAI (@google/genai 1.4.0)
 // ============================================================================
+
+process.on("uncaughtException", (e) => { console.error("❌ uncaughtException:", e); });
+process.on("unhandledRejection", (e) => { console.error("❌ unhandledRejection:", e); });
+
+console.log("🚀 Boot Oppi: iniciando server.js...");
 
 // ------------------------------
 // Imports
@@ -9,7 +14,8 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import multer from "multer";
+import multerPkg from "multer";
+const multer = multerPkg.default ?? multerPkg; // compat ESM/CJS
 import ini from "ini";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -20,7 +26,7 @@ import { GoogleGenAI } from "@google/genai";
 dotenv.config();
 
 // ------------------------------
-// Inicialización IA
+// IA: GoogleGenAI
 // ------------------------------
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -30,17 +36,15 @@ async function askGemini(modelName, contents) {
     contents,
   });
 
+  // Forma estable: tomamos el primer texto disponible
   return (
     result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null
   );
 }
 
-// ------------------------------
-// Helper robusto para extraer JSON del texto de la IA
-// ------------------------------
+// Helper robusto para extraer JSON desde la respuesta de la IA
 function extractJsonFromText(raw) {
   if (!raw || typeof raw !== "string") return null;
-
   let text = raw.trim();
 
   // 1) Si viene dentro de ``` ``` o ```json ```
@@ -50,43 +54,39 @@ function extractJsonFromText(raw) {
   }
 
   // 2) Recortar desde el primer { hasta el último }
-  const open = text.indexOf("{");
-  const close = text.lastIndexOf("}");
-  if (open === -1 || close === -1 || close <= open) {
-    return null;
-  }
+  const s = text.indexOf("{");
+  const e = text.lastIndexOf("}");
+  if (s === -1 || e === -1 || e <= s) return null;
 
-  const candidate = text.slice(open, close + 1);
-
-  // 3) Intentar parsear
+  const candidate = text.slice(s, e + 1);
   try {
     return JSON.parse(candidate);
-  } catch (e) {
-    console.error("❌ No pude parsear JSON:", e, "\nTexto candidato:\n", candidate);
+  } catch (err) {
+    console.error("❌ No pude parsear JSON:", err, "\nTexto candidato:\n", candidate);
     return null;
   }
 }
 
 // ------------------------------
-// Express Config
+// Express + CORS
 // ------------------------------
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:3000",
-    "https://pedro-cabezas.github.io",
-    "https://pedro-cabezas.github.io/opifex"
-  ]
-}));
+
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
+  "https://pedro-cabezas.github.io",
+  "https://pedro-cabezas.github.io/opifex"
+];
+app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: false }));
 
 // ------------------------------
-// Memoria por hilo
+// Memoria y perfiles
 // ------------------------------
-const memory = new Map();      // Id → [{role, text}]
-const profiles = new Map();    // Id → {raw, data, summary}
+const memory = new Map();    // threadId -> [{ role, text }]
+const profiles = new Map();  // threadId -> { raw, data, summary }
 const MAX_TURNS = 12;
 
 function getThread(threadId) {
@@ -95,23 +95,193 @@ function getThread(threadId) {
 }
 
 function pushTurn(threadId, role, text) {
-  const arr = getThread(threadId);
-  arr.push({ role, text });
-  while (arr.length > MAX_TURNS) arr.shift();
+  const thread = getThread(threadId);
+  thread.push({ role, text });
+  while (thread.length > MAX_TURNS) thread.shift();
 }
 
 // ------------------------------
-// Sistema Oppi
+// Sistema / Prompt de Oppi
 // ------------------------------
-const SYSTEM_PROMPT =
-`Sos Oppi, asistente experto en impresión 3D.
-— Español rioplatense, claro y amable.
-— Cuando generes perfiles .ini devolvelos SOLO dentro de bloques \`\`\`ini\`\`\`.
-— Recordá el contexto de la pieza y la impresora.
-`;
+const SYSTEM = `Sos Oppi, asistente experto en impresión 3D (PrusaSlicer/OctoPrint).
+- Español rioplatense, claro y amable.
+- Cuando el usuario pida un perfil, devolvelo SIEMPRE dentro de un bloque \`\`\`ini ... \`\`\` como Config Bundle válido ([print], [filament], [printer]) sin texto fuera del bloque.
+- Si hay ambigüedad, hacé 1-2 preguntas de seguimiento muy concretas.
+- Recordá el contexto reciente (pieza, material, impresora) y retomalo.`;
 
 // ------------------------------
-// STL Library
+// Helpers para resumen de perfil .ini
+// ------------------------------
+const pick = (obj, keys) => {
+  const o = {};
+  for (const k of keys) if (obj && Object.prototype.hasOwnProperty.call(obj, k)) o[k] = obj[k];
+  return o;
+};
+
+function summarizeProfile(iniData) {
+  const print    = iniData.print    || iniData.Print    || {};
+  const filament = iniData.filament || iniData.Filament || {};
+  const printer  = iniData.printer  || iniData.Printer  || {};
+
+  const corePrint = pick(print, [
+    "layer_height","perimeters","top_solid_layers","bottom_solid_layers",
+    "fill_density","fill_pattern","fill_angle",
+    "perimeter_speed","infill_speed","solid_infill_speed","top_solid_infill_speed",
+    "gap_fill_speed","travel_speed","first_layer_speed","bridge_speed"
+  ]);
+  const coreTemp = pick(filament, [
+    "temperature","first_layer_temperature","bed_temperature","first_layer_bed_temperature"
+  ]);
+  const coreFan  = pick(filament, ["min_fan_speed","max_fan_speed","bridge_fan_speed"]);
+  const corePrinter = pick(printer, ["nozzle_diameter","max_print_height","bed_shape"]);
+
+  const lines = [];
+  lines.push("**Resumen de perfil importado**");
+  if (Object.keys(coreTemp).length)    lines.push("— **Temperaturas**: " + JSON.stringify(coreTemp));
+  if (Object.keys(coreFan).length)     lines.push("— **Ventilador**: " + JSON.stringify(coreFan));
+  if (Object.keys(corePrint).length)   lines.push("— **Impresión/Velocidades**: " + JSON.stringify(corePrint));
+  if (Object.keys(corePrinter).length) lines.push("— **Impresora**: " + JSON.stringify(corePrinter));
+  if (lines.length === 1) lines.push("Secciones detectadas: " + JSON.stringify(Object.keys(iniData)));
+  return lines.join("\n");
+}
+
+async function writeTmpIni(iniText) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
+  const file = path.join(dir, "oppi-profile.prusa.ini");
+  await fs.writeFile(file, iniText, "utf8");
+  return file;
+}
+
+// ------------------------------
+// Generador de .ini — PARAM_KEYS, normalización, bed_shape
+// ------------------------------
+const PARAM_KEYS = [
+  // capas/geometría
+  "layer_height", "perimeters", "top_solid_layers", "bottom_solid_layers", "first_layer_height",
+  // densidad/patrón
+  "fill_density", "fill_pattern", "fill_angle",
+  // velocidades
+  "perimeter_speed", "infill_speed", "solid_infill_speed", "top_solid_infill_speed",
+  "gap_fill_speed", "travel_speed", "first_layer_speed", "bridge_speed",
+  // temperaturas
+  "first_layer_temperature", "temperature", "bed_temperature", "first_layer_bed_temperature",
+  // ventilador
+  "min_fan_speed", "max_fan_speed", "bridge_fan_speed",
+  // retracción
+  "retract_length", "retract_speed", "deretract_speed", "retract_restart_extra", "retract_lift",
+  // adhesión
+  "brim_width", "brim_type", "skirt_distance", "skirts",
+  // filamento/boquilla
+  "filament_diameter", "extrusion_multiplier", "nozzle_diameter",
+  // impresora/volumen cama
+  "max_print_height", "bed_shape",
+];
+
+const KEY_MAP = {
+  // infill
+  "infill_density": "fill_density",
+  "infill_pattern": "fill_pattern",
+  // ventilador
+  "fan_speed": "min_fan_speed",
+  "fan_min_speed": "min_fan_speed",
+  "fan_max_speed": "max_fan_speed",
+  // temperaturas
+  "nozzle_temperature": "temperature",
+  // retracción
+  "lift_z": "retract_lift",
+};
+
+const PERCENT_KEYS = new Set([
+  "fill_density",
+  "min_fan_speed","max_fan_speed","bridge_fan_speed",
+]);
+
+function normalizeParams(raw = {}) {
+  const out = {};
+  // mapear sinónimos
+  for (const [k, v] of Object.entries(raw)) out[KEY_MAP[k] || k] = v;
+  // fan_speed => min/max si faltan
+  if (raw.fan_speed != null) {
+    if (out.min_fan_speed == null) out.min_fan_speed = raw.fan_speed;
+    if (out.max_fan_speed == null) out.max_fan_speed = raw.fan_speed;
+  }
+  // tipado y % explícito
+  for (const k of Object.keys(out)) {
+    let val = out[k];
+    if (typeof val === "string" && val.trim() !== "" && !val.trim().endsWith("%") && !isNaN(Number(val))) {
+      val = Number(val);
+    }
+    if (PERCENT_KEYS.has(k) && typeof val === "number") val = `${val}%`;
+    out[k] = val;
+  }
+  return out;
+}
+
+function sanitizeBedShape(val) {
+  if (!val) return null;
+  val = String(val).replace(/\s+/g, "");
+  const ok = /^-?\d+(\.\d+)?x-?\d+(\.\d+)?(,-?\d+(\.\d+)?x-?\d+(\.\d+)?){3,}$/i.test(val);
+  return ok ? val : null;
+}
+
+function defaultBedShapeFor(threadId) {
+  if (profiles.has(threadId)) {
+    const dat = profiles.get(threadId).data;
+    const raw = dat?.printer?.bed_shape || dat?.bed_shape;
+    const s = sanitizeBedShape(raw);
+    if (s) return s;
+  }
+  // default: MK3S 250x210
+  return "0x0,250x0,250x210,0x210";
+}
+
+function buildIniFromParams(params = {}, ctx = {}) {
+  const p = normalizeParams(params);
+
+  // asegurar bed_shape válido
+  let bedShape = sanitizeBedShape(p.bed_shape);
+  if (!bedShape) bedShape = defaultBedShapeFor(ctx.threadId);
+  p.bed_shape = bedShape;
+
+  const filtered = {};
+  for (const k of PARAM_KEYS) {
+    const v = p[k];
+    if (v !== undefined && v !== null && v !== "") filtered[k] = v;
+  }
+
+  const GROUPS = [
+    ["; ---- Capas/Geometría", ["layer_height","first_layer_height","perimeters","top_solid_layers","bottom_solid_layers","nozzle_diameter"]],
+    ["; ---- Infill", ["fill_density","fill_pattern","fill_angle"]],
+    ["; ---- Velocidades", ["perimeter_speed","infill_speed","solid_infill_speed","top_solid_infill_speed","gap_fill_speed","first_layer_speed","bridge_speed","travel_speed"]],
+    ["; ---- Temperaturas", ["temperature","first_layer_temperature","bed_temperature","first_layer_bed_temperature"]],
+    ["; ---- Ventilador", ["min_fan_speed","max_fan_speed","bridge_fan_speed"]],
+    ["; ---- Retracción/Mov.", ["retract_length","retract_speed","deretract_speed","retract_restart_extra","retract_lift"]],
+    ["; ---- Adhesión", ["brim_type","brim_width","skirt_distance","skirts"]],
+    ["; ---- Filamento/Impresora", ["filament_diameter","extrusion_multiplier","max_print_height","bed_shape"]],
+  ];
+
+  let out = `; ============================\n; Perfil generado por Oppi\n; ============================\n\n`;
+  const printed = new Set();
+
+  for (const [title, keys] of GROUPS) {
+    const lines = [];
+    for (const k of keys) {
+      if (filtered[k] !== undefined) {
+        lines.push(`${k} = ${filtered[k]}`);
+        printed.add(k);
+      }
+    }
+    if (lines.length) out += `${title}\n${lines.join("\n")}\n\n`;
+  }
+
+  const rest = Object.keys(filtered).filter(k => !printed.has(k));
+  if (rest.length) out += `; ---- Otros\n` + rest.map(k => `${k} = ${filtered[k]}`).join("\n") + "\n";
+
+  return out.trim() + "\n";
+}
+
+// ------------------------------
+// Biblioteca STL
 // ------------------------------
 let STL_CACHE = null;
 async function loadStlLibrary() {
@@ -119,7 +289,8 @@ async function loadStlLibrary() {
   try {
     const raw = await fs.readFile(path.join(process.cwd(), "data", "stl-library.json"), "utf8");
     STL_CACHE = JSON.parse(raw);
-  } catch {
+  } catch (e) {
+    console.error("❌ Error cargando stl-library.json:", e);
     STL_CACHE = [];
   }
   return STL_CACHE;
@@ -130,9 +301,9 @@ function stlScore(model, query) {
     (model.nombre || "") + " " +
     (model.descripcion || "") + " " +
     (model.categoria || "") + " " +
-    (model.tags || []).join(" ");
+    ((Array.isArray(model.tags) ? model.tags : [])).join(" ");
 
-  const words = query.toLowerCase().split(/\s+/);
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   let score = 0;
   for (const w of words) if (full.toLowerCase().includes(w)) score++;
   return score;
@@ -149,57 +320,25 @@ async function bestStl(prompt) {
 }
 
 // ------------------------------
-// .ini Helpers
-// ------------------------------
-function summarizeProfile(parsed) {
-  const print = parsed.print || {};
-  const filament = parsed.filament || {};
-  const printer = parsed.printer || {};
-
-  return [
-    "**Perfil importado**",
-    "— Temperaturas: " + JSON.stringify({
-      temp: filament.temperature,
-      first: filament.first_layer_temperature,
-      bed: filament.bed_temperature,
-    }),
-    "— Velocidades: " + JSON.stringify({
-      perim: print.perimeter_speed,
-      infill: print.infill_speed,
-      travel: print.travel_speed,
-    }),
-    "— Impresora: " + JSON.stringify({
-      nozzle: printer.nozzle_diameter,
-      bed_shape: printer.bed_shape,
-    })
-  ].join("\n");
-}
-
-async function writeTmpIni(text) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
-  const file = path.join(dir, "oppi.prusa.ini");
-  await fs.writeFile(file, text);
-  return file;
-}
-
-// ------------------------------
-// Routes
+// Rutas
 // ------------------------------
 
-// =============== CHAT ===============
+// CHAT
 app.post("/chat-oppi", async (req, res) => {
   try {
-    const { message, threadId } = req.body;
-    if (!message || !threadId) return res.status(400).json({ error: "Faltan datos." });
+    const { message, threadId } = req.body || {};
+    if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
 
     const history = getThread(threadId);
-    const profileContext = profiles.has(threadId)
-      ? `\n[Contexto del perfil]\n${profiles.get(threadId).summary}\n`
-      : "";
+    let profileContext = "";
+    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
     const contents = [
-      { role: "user", parts: [{ text: SYSTEM_PROMPT + profileContext }] },
-      ...history.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
+      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
+      ...history.map(t => ({
+        role: t.role === "model" ? "model" : "user",
+        parts: [{ text: t.text }]
+      })),
       { role: "user", parts: [{ text: message }] }
     ];
 
@@ -208,136 +347,139 @@ app.post("/chat-oppi", async (req, res) => {
     pushTurn(threadId, "user", message);
     pushTurn(threadId, "model", text || "(sin respuesta)");
 
-    return res.json({ reply: text || "No pude generar respuesta." });
-
-  } catch (e) {
-    console.error("❌ Chat error:", e);
-    return res.status(500).json({ error: "Error al generar respuesta." });
+    res.json({ reply: text || "No pude generar respuesta." });
+  } catch (err) {
+    console.error("❌ Chat error:", err);
+    res.status(500).json({ error: "Error al generar respuesta." });
   }
 });
 
-// =============== RESET MEMORIA ===============
+// RESET hilo
 app.post("/reset-thread", (req, res) => {
-  const { threadId } = req.body;
-  if (threadId) {
-    memory.delete(threadId);
-    profiles.delete(threadId);
-  }
+  const { threadId } = req.body || {};
+  if (threadId) { memory.delete(threadId); profiles.delete(threadId); }
   res.json({ ok: true });
 });
 
-// =============== IMPORT .INI ===============
-const upload = multer({ storage: multer.memoryStorage() });
+// IMPORTAR .ini
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
-app.post("/import-ini", upload.single("file"), (req, res) => {
+app.post("/import-ini", upload.single("file"), async (req, res) => {
   try {
-    const { threadId } = req.body;
+    const { threadId } = req.body || {};
     if (!threadId) return res.status(400).json({ error: "Falta threadId." });
-    if (!req.file) return res.status(400).json({ error: "Falta archivo." });
+    if (!req.file)   return res.status(400).json({ error: "Subí un archivo .ini." });
 
     const raw = req.file.buffer.toString("utf8");
-    const parsed = ini.parse(raw);
-    const summary = summarizeProfile(parsed);
+    const data = ini.parse(raw);
+    const summary = summarizeProfile(data);
 
-    profiles.set(threadId, { raw, data: parsed, summary });
-    pushTurn(threadId, "user", `Importé un perfil.\n${summary}`);
-
-    return res.json({ ok: true, summary });
-  } catch (e) {
-    console.error("❌ import .ini:", e);
-    res.status(500).json({ error: "No pude importar perfil." });
+    profiles.set(threadId, { raw, data, summary });
+    pushTurn(threadId, "user", `Nota de sistema: Se importó un perfil .ini para este hilo.\n${summary}`);
+    res.json({ ok: true, summary });
+  } catch (err) {
+    console.error("❌ import-ini error:", err);
+    res.status(500).json({ error: "No se pudo importar el .ini." });
   }
 });
 
-// =============== GENERAR INI CON IA ===============
+// GENERAR .ini con IA
 app.post("/generate-ini-ai", async (req, res) => {
   try {
-    const { threadId } = req.body;
+    const { threadId, overrides } = req.body || {};
     if (!threadId) return res.status(400).json({ error: "Falta threadId." });
 
     const history = getThread(threadId);
+    let profileContext = "";
+    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
-    const ask = `
-Quiero que generes parámetros de impresión para PrusaSlicer.
-
-Respondé EXCLUSIVAMENTE un JSON válido, sin nada de texto alrededor.
-Usá SOLO claves reales de PrusaSlicer como:
-- layer_height, perimeters, top_solid_layers, bottom_solid_layers
-- fill_density, fill_pattern, travel_speed, perimeter_speed, infill_speed
-- temperature, first_layer_temperature, bed_temperature, first_layer_bed_temperature
-- nozzle_diameter, bed_shape, max_print_height
-
-Ejemplo de formato (no lo copies literal, es solo para ver la forma):
-
-{
-  "layer_height": 0.2,
-  "perimeters": 3,
-  "fill_density": "20%",
-  "temperature": 200,
-  "bed_temperature": 60
-}
-
-IMPORTANTE:
-- Usá SIEMPRE comillas dobles para las claves y los strings.
-- NO agregues texto, explicaciones ni bloques de markdown alrededor (nada de \`\`\`).
-Solo quiero el JSON.
+    const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
+    const askJson = `
+Quiero que construyas un JSON de parámetros para PrusaSlicer (modo principiante estable).
+Usá SOLO estas claves exactamente (puede faltar alguna si no aplica): [${schemaList}].
+Valores numéricos donde corresponda (mm, mm/s, °C, %, etc.). Si falta info, elegí valores seguros tipo "Modo Abuela".
+IMPORTANTE: respondé SOLO con JSON plano válido (sin markdown, sin comentarios, sin texto extra).
 `;
 
     const contents = [
-      { role: "user", parts: [{ text: SYSTEM_PROMPT }] },
-      ...history.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
-      { role: "user", parts: [{ text: ask }] }
+      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
+      ...history.map(t => ({
+        role: t.role === "model" ? "model" : "user",
+        parts: [{ text: t.text }]
+      })),
+      { role: "user", parts: [{ text: askJson }] }
     ];
 
-    const raw = await askGemini("gemini-2.0-flash", contents);
-
+    const raw = await askGemini("gemini-2.5-flash", contents);
     if (!raw) {
       console.error("❌ generate-ini-ai: IA no devolvió texto");
       return res.status(502).json({ error: "La IA no devolvió contenido." });
     }
 
     const json = extractJsonFromText(raw);
-
     if (!json) {
       console.error("❌ Respuesta cruda de la IA (sin JSON válido):\n", raw);
       return res.status(502).json({ error: "La IA no devolvió JSON válido." });
     }
 
-    let iniText = "; Oppi Profile\n\n";
-    for (const [k, v] of Object.entries(json)) {
-      iniText += `${k} = ${v}\n`;
-    }
+    const params = { ...json, ...(overrides || {}) };
+    const iniText = buildIniFromParams(params, { threadId });
 
-    pushTurn(threadId, "model", iniText);
-
-    return res.json({ ok: true, iniText });
-
-  } catch (e) {
-    console.error("❌ generate-ini-ai:", e);
-    return res.status(500).json({ error: "No pude generar el .ini con IA." });
+    res.json({ ok: true, params: normalizeParams(params), iniText });
+  } catch (err) {
+    console.error("❌ generate-ini-ai error:", err);
+    res.status(500).json({ error: "No pude generar el .ini con IA." });
   }
 });
 
-// =============== SUGERIR STL ===============
+// SUGERIR STL
 app.post("/api/stl/suggest", async (req, res) => {
   try {
-    const { prompt } = req.body;
-    if (!prompt) return res.json({ found: false });
+    const { prompt } = req.body || {};
+    if (!prompt || !prompt.trim()) return res.json({ found: false });
 
     const model = await bestStl(prompt);
     if (!model) return res.json({ found: false });
 
-    return res.json({ found: true, model });
-
-  } catch (e) {
-    console.error("❌ STL error:", e);
-    return res.status(500).json({ error: "No pude buscar STL." });
+    res.json({ found: true, model });
+  } catch (err) {
+    console.error("❌ STL error:", err);
+    res.status(500).json({ error: "No pude buscar STL." });
   }
 });
 
-// =============== SERVIDOR ===============
+// (Opcional) ABRIR en PrusaSlicer local
+app.post("/open-prusa", async (req, res) => {
+  try {
+    const { iniText, iniPath } = req.body || {};
+    const prusaPath = process.env.PRUSASLICER_PATH;
+    if (!prusaPath) return res.status(400).json({ error: "Falta PRUSASLICER_PATH en .env" });
+
+    let fileToLoad = iniPath;
+    if (!fileToLoad) {
+      if (!iniText) return res.status(400).json({ error: "Falta iniText o iniPath." });
+      fileToLoad = await writeTmpIni(iniText);
+    }
+
+    const child = spawn(prusaPath, ["--load", fileToLoad], { detached: true, stdio: "ignore" });
+    child.unref();
+    res.json({ ok: true, loaded: fileToLoad });
+  } catch (err) {
+    console.error("❌ open-prusa error:", err);
+    res.status(500).json({ error: "No pude abrir PrusaSlicer con ese .ini." });
+  }
+});
+
+// ------------------------------
+// Iniciar servidor
+// ------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Oppi Backend v2 corriendo en puerto ${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`🧠 Oppi con memoria en puerto ${PORT}`);
+});
+
+server.on("error", (err) => {
+  console.error("❌ No se pudo iniciar el servidor:", err);
+  process.exit(1);
 });
 
