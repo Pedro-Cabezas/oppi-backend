@@ -36,6 +36,38 @@ async function askGemini(modelName, contents) {
 }
 
 // ------------------------------
+// Helper robusto para extraer JSON del texto de la IA
+// ------------------------------
+function extractJsonFromText(raw) {
+  if (!raw || typeof raw !== "string") return null;
+
+  let text = raw.trim();
+
+  // 1) Si viene dentro de ``` ``` o ```json ```
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    text = fenced[1].trim();
+  }
+
+  // 2) Recortar desde el primer { hasta el último }
+  const open = text.indexOf("{");
+  const close = text.lastIndexOf("}");
+  if (open === -1 || close === -1 || close <= open) {
+    return null;
+  }
+
+  const candidate = text.slice(open, close + 1);
+
+  // 3) Intentar parsear
+  try {
+    return JSON.parse(candidate);
+  } catch (e) {
+    console.error("❌ No pude parsear JSON:", e, "\nTexto candidato:\n", candidate);
+    return null;
+  }
+}
+
+// ------------------------------
 // Express Config
 // ------------------------------
 const app = express();
@@ -223,15 +255,34 @@ app.post("/generate-ini-ai", async (req, res) => {
     const { threadId } = req.body;
     if (!threadId) return res.status(400).json({ error: "Falta threadId." });
 
+    const history = getThread(threadId);
+
     const ask = `
-Generame SOLO un JSON de parámetros para PrusaSlicer.
-Solo con claves reales: layer_height, perimeters, fill_density, travel_speed, temperature,
-first_layer_temperature, bed_temperature, nozzle_diameter, bed_shape, etc.
-Valores modo abuela si falta info.
-NO escribas texto fuera del JSON.
+Quiero que generes parámetros de impresión para PrusaSlicer.
+
+Respondé EXCLUSIVAMENTE un JSON válido, sin nada de texto alrededor.
+Usá SOLO claves reales de PrusaSlicer como:
+- layer_height, perimeters, top_solid_layers, bottom_solid_layers
+- fill_density, fill_pattern, travel_speed, perimeter_speed, infill_speed
+- temperature, first_layer_temperature, bed_temperature, first_layer_bed_temperature
+- nozzle_diameter, bed_shape, max_print_height
+
+Ejemplo de formato (no lo copies literal, es solo para ver la forma):
+
+{
+  "layer_height": 0.2,
+  "perimeters": 3,
+  "fill_density": "20%",
+  "temperature": 200,
+  "bed_temperature": 60
+}
+
+IMPORTANTE:
+- Usá SIEMPRE comillas dobles para las claves y los strings.
+- NO agregues texto, explicaciones ni bloques de markdown alrededor (nada de \`\`\`).
+Solo quiero el JSON.
 `;
 
-    const history = getThread(threadId);
     const contents = [
       { role: "user", parts: [{ text: SYSTEM_PROMPT }] },
       ...history.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
@@ -239,16 +290,23 @@ NO escribas texto fuera del JSON.
     ];
 
     const raw = await askGemini("gemini-2.0-flash", contents);
-    const open = raw.indexOf("{");
-    const close = raw.lastIndexOf("}");
-    if (open === -1 || close === -1) {
+
+    if (!raw) {
+      console.error("❌ generate-ini-ai: IA no devolvió texto");
+      return res.status(502).json({ error: "La IA no devolvió contenido." });
+    }
+
+    const json = extractJsonFromText(raw);
+
+    if (!json) {
+      console.error("❌ Respuesta cruda de la IA (sin JSON válido):\n", raw);
       return res.status(502).json({ error: "La IA no devolvió JSON válido." });
     }
 
-    const json = JSON.parse(raw.slice(open, close + 1));
-
     let iniText = "; Oppi Profile\n\n";
-    for (const [k, v] of Object.entries(json)) iniText += `${k} = ${v}\n`;
+    for (const [k, v] of Object.entries(json)) {
+      iniText += `${k} = ${v}\n`;
+    }
 
     pushTurn(threadId, "model", iniText);
 
@@ -282,3 +340,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Oppi Backend v2 corriendo en puerto ${PORT}`);
 });
+
