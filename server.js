@@ -5,6 +5,7 @@
 // - Generar .ini (nombres de Prusa) con sanitización de bed_shape
 // - Abrir en PrusaSlicer (solo si corre local y PRUSASLICER_PATH está definido)
 // - CORS para GitHub Pages (https://pedro-cabezas.github.io/opifex)
+// - Biblioteca STL (sugerencias simples sin IA)
 // ============================================================================
 
 // ---------- Diagnóstico global ----------
@@ -28,10 +29,9 @@ import path from "node:path";
 // ---------- .env ----------
 dotenv.config();
 
-// ---------- Anti doble arranque (por seguridad en ciertos entornos) ----------
+// ---------- Anti doble arranque ----------
 if (globalThis.__OPPI_STARTED__) {
   console.log("⚠️ Oppi ya estaba iniciado; evitando doble arranque.");
-  // Nota: si llegaste acá y no tenés otra instancia, probablemente lo estás importando desde otro archivo.
 } else {
   console.log("✅ Primer arranque de Oppi.");
   globalThis.__OPPI_STARTED__ = true;
@@ -40,14 +40,14 @@ if (globalThis.__OPPI_STARTED__) {
   // Express + Gemini
   // ========================================================================
   const app = express();
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-if (!process.env.GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY no está definido en las variables de entorno.");
-}
+  const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!GEMINI_KEY) {
+    console.warn("⚠️ GEMINI_API_KEY / GOOGLE_API_KEY no está definido. La IA NO va a funcionar.");
+  }
+  const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
-  // ---------- CORS: permitimos localhost y TU GitHub Pages ----------
+  // ---------- CORS ----------
   const ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",
@@ -55,7 +55,7 @@ if (!process.env.GEMINI_API_KEY) {
     "https://pedro-cabezas.github.io",
     "https://pedro-cabezas.github.io/opifex"
   ];
-  app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET","POST"] }));
+  app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] }));
 
   // ---------- Middlewares base ----------
   app.use(express.json({ limit: "2mb" }));
@@ -78,8 +78,6 @@ if (!process.env.GEMINI_API_KEY) {
     t.push({ role, parts: [{ text }] });
     while (t.length > MAX_TURNS) t.shift();
   }
-
-
 
   // ========================================================================
   // Helpers varios
@@ -132,6 +130,7 @@ if (!process.env.GEMINI_API_KEY) {
       const stlPath = path.join(process.cwd(), "data", "stl-library.json");
       const raw = await fs.readFile(stlPath, "utf8");
       stlLibraryCache = JSON.parse(raw);
+      console.log(`📂 STL library cargada (${stlLibraryCache.length} modelos).`);
     } catch (e) {
       console.error("❌ Error cargando stl-library.json:", e);
       stlLibraryCache = [];
@@ -139,13 +138,11 @@ if (!process.env.GEMINI_API_KEY) {
     return stlLibraryCache;
   }
 
-   // Normalizar: minúsculas + sin tildes
-    // Normalizar: minúsculas + sin tildes
   function normalize(str = "") {
     return String(str)
       .toLowerCase()
       .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, ""); // saca acentos
+      .replace(/[\u0300-\u036f]/g, "");
   }
 
   const STOPWORDS = new Set([
@@ -170,16 +167,12 @@ if (!process.env.GEMINI_API_KEY) {
     if (!words.length) return 0;
 
     let score = 0;
+    const tags = (model.tags || []).map(t => normalize(t));
 
     for (const w of words) {
       if (text.includes(w)) score += 2; // match general
-    }
-
-    // Bonus: matches en tags
-    const tags = (model.tags || []).map(t => normalize(t));
-    for (const w of words) {
-      if (tags.includes(w)) score += 3;                // exacto
-      else if (tags.some(t => t.includes(w))) score++; // parcial
+      if (tags.includes(w)) score += 3;                // tag exacto
+      else if (tags.some(t => t.includes(w))) score++; // tag parcial
     }
 
     return score;
@@ -194,18 +187,13 @@ if (!process.env.GEMINI_API_KEY) {
       .filter(m => m.score > 0)
       .sort((a, b) => b.score - a.score);
 
-    // si nada matchea, devolvemos Benchy como “modelo test”
     if (!scored.length) {
       const benchy = library.find(m => m.id === "benchy") || library[0];
       return benchy;
     }
-
     return scored[0];
   }
 
-
-
-  
   async function writeTmpIni(iniText) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
     const file = path.join(dir, "oppi-profile.prusa.ini");
@@ -238,7 +226,6 @@ if (!process.env.GEMINI_API_KEY) {
     "max_print_height","bed_shape"
   ];
 
-  // Sinónimos (por si la IA o el user mandan otras claves)
   const KEY_MAP = {
     "infill_density": "fill_density",
     "infill_pattern": "fill_pattern",
@@ -249,19 +236,17 @@ if (!process.env.GEMINI_API_KEY) {
     "lift_z": "retract_lift",
   };
 
-  // Claves que deben llevar "%"
   const PERCENT_KEYS = new Set(["fill_density","min_fan_speed","max_fan_speed","bridge_fan_speed"]);
 
   function normalizeParams(raw = {}) {
     const out = {};
-    // mapear sinónimos
     for (const [k, v] of Object.entries(raw)) out[KEY_MAP[k] || k] = v;
-    // si vino solo fan_speed, lo usamos para min/max
+
     if (raw.fan_speed != null) {
       if (out.min_fan_speed == null) out.min_fan_speed = raw.fan_speed;
       if (out.max_fan_speed == null) out.max_fan_speed = raw.fan_speed;
     }
-    // tipado y % explícito
+
     for (const k of Object.keys(out)) {
       let val = out[k];
       if (typeof val === "string" && val.trim() && !val.trim().endsWith("%") && !isNaN(Number(val))) {
@@ -273,7 +258,6 @@ if (!process.env.GEMINI_API_KEY) {
     return out;
   }
 
-  // bed_shape: "0x0,250x0,250x210,0x210" (sin espacios, al menos 4 puntos)
   function sanitizeBedShape(val) {
     if (!val) return null;
     val = String(val).replace(/\s+/g, "");
@@ -287,25 +271,22 @@ if (!process.env.GEMINI_API_KEY) {
       const s = sanitizeBedShape(raw);
       if (s) return s;
     }
-    // Por defecto: Prusa MK3S (250x210). Cambiá si querés otra impresora default.
     return "0x0,250x0,250x210,0x210";
   }
 
   function buildIniFromParams(params = {}, ctx = {}) {
     const p = normalizeParams(params);
-    // asegurar bed_shape válido
+
     let bedShape = sanitizeBedShape(p.bed_shape);
     if (!bedShape) bedShape = defaultBedShapeFor(ctx.threadId);
     p.bed_shape = bedShape;
 
-    // mantener solo las claves oficiales y en orden
     const filtered = {};
     for (const k of PARAM_KEYS) {
       const v = p[k];
       if (v !== undefined && v !== null && v !== "") filtered[k] = v;
     }
 
-    // salida ordenada en grupos (legible, aunque no es requisito de Prusa)
     const GROUPS = [
       ["; ---- Capas/Geometría", ["layer_height","first_layer_height","perimeters","top_solid_layers","bottom_solid_layers","nozzle_diameter"]],
       ["; ---- Infill", ["fill_density","fill_pattern","fill_angle"]],
@@ -328,7 +309,6 @@ if (!process.env.GEMINI_API_KEY) {
       if (lines.length) out += `${title}\n${lines.join("\n")}\n\n`;
     }
 
-    // resto (por si agregamos nuevas claves en el futuro)
     const rest = Object.keys(filtered).filter(k => !printed.has(k));
     if (rest.length) out += `; ---- Otros\n` + rest.map(k => `${k} = ${filtered[k]}`).join("\n") + "\n";
 
@@ -344,41 +324,57 @@ if (!process.env.GEMINI_API_KEY) {
     return null;
   }
 
+  function buildHistoryText(history) {
+    if (!history || !history.length) return "";
+    let out = "";
+    for (const turn of history) {
+      const role = turn.role === "model" ? "Oppi" : "Usuario";
+      const text = turn.parts?.[0]?.text || "";
+      out += `${role}: ${text}\n`;
+    }
+    return out;
+  }
+
   // ========================================================================
   // Rutas HTTP
   // ========================================================================
 
-  // Chat principal
-    app.post("/chat-oppi", async (req, res) => {
-  try {
-    const { message, threadId } = req.body || {};
-    if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
+  // Chat principal (usa prompt en texto plano)
+  app.post("/chat-oppi", async (req, res) => {
+    try {
+      const { message, threadId } = req.body || {};
+      if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
 
-    const history = getThread(threadId);
-    let profileContext = "";
-    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+      const history = getThread(threadId);
+      let profileContext = "";
+      if (profiles.has(threadId)) profileContext = `\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
-    const contents = [
-      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-      ...history,
-      { role: "user", parts: [{ text: message }] }
-    ];
+      const historyText = buildHistoryText(history);
 
-    // ⭐ Nueva llamada correcta
-    const result = await model.generateContent({ contents });
-    const text = result.response.text();
+      const prompt = `${SYSTEM}
+${profileContext}
 
-    pushTurn(threadId, "user", message);
-    pushTurn(threadId, "model", text);
+[Conversación hasta ahora]
+${historyText}
+Usuario: ${message}
+Oppi:`;
 
-    res.json({ reply: text });
-  } catch (e) {
-    console.error("❌ Error en /chat-oppi:", e);
-    res.status(500).json({ error: "Error al generar respuesta." });
-  }
-});
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt
+      });
 
+      const text = response?.text ?? "No pude generar respuesta.";
 
+      pushTurn(threadId, "user", message);
+      pushTurn(threadId, "model", text);
+
+      res.json({ reply: text });
+    } catch (e) {
+      console.error("❌ Error en /chat-oppi:", e);
+      res.status(500).json({ error: "Error al generar respuesta." });
+    }
+  });
 
   // Reset memoria del hilo
   app.post("/reset-thread", (req, res) => {
@@ -387,7 +383,7 @@ if (!process.env.GEMINI_API_KEY) {
     res.json({ ok: true });
   });
 
-    // Sugerir STL en base a un texto
+  // Sugerir STL en base a un texto
   app.post("/api/stl/suggest", async (req, res) => {
     try {
       const { prompt } = req.body || {};
@@ -410,7 +406,6 @@ if (!process.env.GEMINI_API_KEY) {
     }
   });
 
-
   // Importar .ini (para usar como contexto)
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
   app.post("/import-ini", upload.single("file"), async (req, res) => {
@@ -428,50 +423,54 @@ if (!process.env.GEMINI_API_KEY) {
 
       res.json({ ok: true, summary });
     } catch (e) {
-      console.error(e);
+      console.error("❌ Error en /import-ini:", e);
       res.status(500).json({ error: "No se pudo importar el .ini." });
     }
   });
 
-  // Generar .ini con IA
-    app.post("/generate-ini-ai", async (req, res) => {
-  try {
-    const { threadId, overrides } = req.body || {};
-    if (!threadId) return res.status(400).json({ error: "Falta threadId." });
+  // Generar .ini con IA (prompt en texto plano)
+  app.post("/generate-ini-ai", async (req, res) => {
+    try {
+      const { threadId, overrides } = req.body || {};
+      if (!threadId) return res.status(400).json({ error: "Falta threadId." });
 
-    const history = getThread(threadId);
-    let profileContext = "";
-    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+      const history = getThread(threadId);
+      let profileContext = "";
+      if (profiles.has(threadId)) profileContext = `\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
-    const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
-    const askJson = `
-Quiero un JSON con parámetros de impresión para PrusaSlicer usando SOLO estas claves: [${schemaList}].
-Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido.
-    `;
+      const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
+      const historyText = buildHistoryText(history);
 
-    const contents = [
-      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-      ...history,
-      { role: "user", parts: [{ text: askJson }] }
-    ];
+      const prompt = `${SYSTEM}
+${profileContext}
 
-    // ⭐ Nueva llamada correcta
-    const result = await model.generateContent({ contents });
-    const raw = result.response.text();
+[Conversación hasta ahora]
+${historyText}
 
-    const json = extractJson(raw);
-    if (!json) return res.status(502).json({ error: "La IA no devolvió JSON válido." });
+Ahora, en base a todo eso, devolveme SOLO un JSON válido (sin markdown, sin comentarios) con parámetros de impresión para PrusaSlicer usando SOLO estas claves: [${schemaList}].
+Usá valores seguros "Modo Abuela" si falta info.`;
 
-    const params = { ...json, ...(overrides || {}) };
-    const iniText = buildIniFromParams(params, { threadId });
+      const resp = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt
+      });
 
-    res.json({ ok: true, params: normalizeParams(params), iniText });
-  } catch (e) {
-    console.error("❌ Error en /generate-ini-ai:", e);
-    res.status(500).json({ error: "No pude generar el .ini con IA." });
-  }
-});
+      const raw = resp?.text ?? "";
+      const json = extractJson(raw);
+      if (!json) {
+        console.error("❌ La IA no devolvió JSON válido. Respuesta cruda:", raw);
+        return res.status(502).json({ error: "La IA no devolvió JSON válido." });
+      }
 
+      const params = { ...json, ...(overrides || {}) };
+      const iniText = buildIniFromParams(params, { threadId });
+
+      res.json({ ok: true, params: normalizeParams(params), iniText });
+    } catch (e) {
+      console.error("❌ Error en /generate-ini-ai:", e);
+      res.status(500).json({ error: "No pude generar el .ini con IA." });
+    }
+  });
 
   // Abrir en PrusaSlicer (solo útil localmente)
   app.post("/open-prusa", async (req, res) => {
@@ -492,23 +491,16 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido.
       child.unref();
       res.json({ ok: true, loaded: fileToLoad });
     } catch (e) {
-      console.error(e);
+      console.error("❌ Error en /open-prusa:", e);
       res.status(500).json({ error: "No pude abrir PrusaSlicer con ese .ini." });
     }
   });
 
   // ========================================================================
-  // Iniciar servidor (Render usa process.env.PORT)
+  // Iniciar servidor
   // ========================================================================
   const PORT = process.env.PORT || 3000;
-  const server = app.listen(PORT, () => {
+  app.listen(PORT, () => {
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
-
-
-
-
-
-
-
