@@ -1,506 +1,284 @@
 // ============================================================================
-// Oppi — Backend universal (funciona local y en Render)
-// - Chat con mini-memoria
-// - Importar .ini como contexto
-// - Generar .ini (nombres de Prusa) con sanitización de bed_shape
-// - Abrir en PrusaSlicer (solo si corre local y PRUSASLICER_PATH está definido)
-// - CORS para GitHub Pages (https://pedro-cabezas.github.io/opifex)
-// - Biblioteca STL (sugerencias simples sin IA)
+// Oppi Backend v2 — Reescritura total (compatible con @google/genai 1.4.0)
+// Autor: ChatGPT + Pedro
 // ============================================================================
 
-// ---------- Diagnóstico global ----------
-process.on("uncaughtException", e => console.error("❌ uncaughtException:", e));
-process.on("unhandledRejection", e => console.error("❌ unhandledRejection:", e));
-console.log("🚀 Boot Oppi: iniciando server.js...");
-
-// ---------- Imports ----------
+// ------------------------------
+// Imports
+// ------------------------------
 import express from "express";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
-import multerPkg from "multer";
-const multer = multerPkg.default ?? multerPkg; // compat CJS/ESM
-import ini from "ini";
 import cors from "cors";
-import { spawn } from "node:child_process";
-import os from "node:os";
+import multer from "multer";
+import ini from "ini";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import { spawn } from "node:child_process";
+import { GoogleGenAI } from "@google/genai";
 
-// ---------- .env ----------
 dotenv.config();
 
-// ---------- Anti doble arranque ----------
-if (globalThis.__OPPI_STARTED__) {
-  console.log("⚠️ Oppi ya estaba iniciado; evitando doble arranque.");
-} else {
-  console.log("✅ Primer arranque de Oppi.");
-  globalThis.__OPPI_STARTED__ = true;
+// ------------------------------
+// Inicialización IA
+// ------------------------------
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-  // ========================================================================
-  // Express + Gemini
-  // ========================================================================
-  const app = express();
+async function askGemini(modelName, contents) {
+  const result = await ai.models.generateContent({
+    model: modelName,
+    contents,
+  });
 
-  const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!GEMINI_KEY) {
-    console.warn("⚠️ GEMINI_API_KEY / GOOGLE_API_KEY no está definido. La IA NO va a funcionar.");
-  }
-  const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
+  return (
+    result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null
+  );
+}
 
-  // ---------- CORS ----------
-  const ALLOWED_ORIGINS = [
+// ------------------------------
+// Express Config
+// ------------------------------
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+app.use(cors({
+  origin: [
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "https://pedro-cabezas.github.io",
     "https://pedro-cabezas.github.io/opifex"
-  ];
-  app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] }));
+  ]
+}));
 
-  // ---------- Middlewares base ----------
-  app.use(express.json({ limit: "2mb" }));
-  app.use(express.urlencoded({ extended: true }));
-  app.use(express.static("public"));
+// ------------------------------
+// Memoria por hilo
+// ------------------------------
+const memory = new Map();      // Id → [{role, text}]
+const profiles = new Map();    // Id → {raw, data, summary}
+const MAX_TURNS = 12;
 
-  // ========================================================================
-  // Estado en memoria (RAM)
-  // ========================================================================
-  const memory = new Map();     // threadId -> [{ role, parts:[{text}] }, ...]
-  const profiles = new Map();   // threadId -> { raw, data, summary }
-  const MAX_TURNS = 12;
+function getThread(threadId) {
+  if (!memory.has(threadId)) memory.set(threadId, []);
+  return memory.get(threadId);
+}
 
-  function getThread(threadId) {
-    if (!memory.has(threadId)) memory.set(threadId, []);
-    return memory.get(threadId);
+function pushTurn(threadId, role, text) {
+  const arr = getThread(threadId);
+  arr.push({ role, text });
+  while (arr.length > MAX_TURNS) arr.shift();
+}
+
+// ------------------------------
+// Sistema Oppi
+// ------------------------------
+const SYSTEM_PROMPT =
+`Sos Oppi, asistente experto en impresión 3D.
+— Español rioplatense, claro y amable.
+— Cuando generes perfiles .ini devolvelos SOLO dentro de bloques \`\`\`ini\`\`\`.
+— Recordá el contexto de la pieza y la impresora.
+`;
+
+// ------------------------------
+// STL Library
+// ------------------------------
+let STL_CACHE = null;
+async function loadStlLibrary() {
+  if (STL_CACHE) return STL_CACHE;
+  try {
+    const raw = await fs.readFile(path.join(process.cwd(), "data", "stl-library.json"), "utf8");
+    STL_CACHE = JSON.parse(raw);
+  } catch {
+    STL_CACHE = [];
   }
-  function pushTurn(threadId, role, text) {
-    const t = getThread(threadId);
-    t.push({ role, parts: [{ text }] });
-    while (t.length > MAX_TURNS) t.shift();
-  }
+  return STL_CACHE;
+}
 
-  // ========================================================================
-  // Helpers varios
-  // ========================================================================
-  const SYSTEM = `Sos Oppi, asistente experto en impresión 3D (PrusaSlicer/OctoPrint).
-- Español rioplatense, claro y amable.
-- Cuando el usuario pida un perfil, devolvelo SIEMPRE dentro de un bloque \`\`\`ini ... \`\`\` (Config Bundle válido) sin texto afuera.
-- Recordá el contexto reciente (pieza, material, impresora) y retomalo.`;
+function stlScore(model, query) {
+  const full =
+    (model.nombre || "") + " " +
+    (model.descripcion || "") + " " +
+    (model.categoria || "") + " " +
+    (model.tags || []).join(" ");
 
-  const pick = (obj, keys) => {
-    const o = {};
-    for (const k of keys) if (obj && Object.prototype.hasOwnProperty.call(obj, k)) o[k] = obj[k];
-    return o;
-  };
+  const words = query.toLowerCase().split(/\s+/);
+  let score = 0;
+  for (const w of words) if (full.toLowerCase().includes(w)) score++;
+  return score;
+}
 
-  function summarizeProfile(iniData) {
-    const print    = iniData.print    || iniData.Print    || {};
-    const filament = iniData.filament || iniData.Filament || {};
-    const printer  = iniData.printer  || iniData.Printer  || {};
+async function bestStl(prompt) {
+  const lib = await loadStlLibrary();
+  const matches = lib
+    .map(m => ({ ...m, score: stlScore(m, prompt) }))
+    .filter(m => m.score > 0)
+    .sort((a, b) => b.score - a.score);
 
-    const corePrint = pick(print, [
-      "layer_height","perimeters","top_solid_layers","bottom_solid_layers",
-      "fill_density","fill_pattern","fill_angle",
-      "perimeter_speed","infill_speed","solid_infill_speed","top_solid_infill_speed",
-      "gap_fill_speed","travel_speed","first_layer_speed","bridge_speed"
-    ]);
-    const coreTemp = pick(filament, [
-      "temperature","first_layer_temperature","bed_temperature","first_layer_bed_temperature"
-    ]);
-    const coreFan  = pick(filament, ["min_fan_speed","max_fan_speed","bridge_fan_speed"]);
-    const corePrinter = pick(printer, ["nozzle_diameter","max_print_height","bed_shape"]);
+  return matches[0] || null;
+}
 
-    const lines = [];
-    lines.push("**Resumen de perfil importado**");
-    if (Object.keys(coreTemp).length)    lines.push("— **Temperaturas**: " + JSON.stringify(coreTemp));
-    if (Object.keys(coreFan).length)     lines.push("— **Ventilador**: " + JSON.stringify(coreFan));
-    if (Object.keys(corePrint).length)   lines.push("— **Velocidades**: " + JSON.stringify(corePrint));
-    if (Object.keys(corePrinter).length) lines.push("— **Impresora**: " + JSON.stringify(corePrinter));
-    return lines.join("\n");
-  }
+// ------------------------------
+// .ini Helpers
+// ------------------------------
+function summarizeProfile(parsed) {
+  const print = parsed.print || {};
+  const filament = parsed.filament || {};
+  const printer = parsed.printer || {};
 
-  // ========================================================================
-  // Biblioteca STL: cargar JSON y buscar mejor modelo
-  // ========================================================================
-  let stlLibraryCache = null;
+  return [
+    "**Perfil importado**",
+    "— Temperaturas: " + JSON.stringify({
+      temp: filament.temperature,
+      first: filament.first_layer_temperature,
+      bed: filament.bed_temperature,
+    }),
+    "— Velocidades: " + JSON.stringify({
+      perim: print.perimeter_speed,
+      infill: print.infill_speed,
+      travel: print.travel_speed,
+    }),
+    "— Impresora: " + JSON.stringify({
+      nozzle: printer.nozzle_diameter,
+      bed_shape: printer.bed_shape,
+    })
+  ].join("\n");
+}
 
-  async function loadStlLibrary() {
-    if (stlLibraryCache) return stlLibraryCache;
-    try {
-      const stlPath = path.join(process.cwd(), "data", "stl-library.json");
-      const raw = await fs.readFile(stlPath, "utf8");
-      stlLibraryCache = JSON.parse(raw);
-      console.log(`📂 STL library cargada (${stlLibraryCache.length} modelos).`);
-    } catch (e) {
-      console.error("❌ Error cargando stl-library.json:", e);
-      stlLibraryCache = [];
-    }
-    return stlLibraryCache;
-  }
+async function writeTmpIni(text) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
+  const file = path.join(dir, "oppi.prusa.ini");
+  await fs.writeFile(file, text);
+  return file;
+}
 
-  function normalize(str = "") {
-    return String(str)
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
-  }
+// ------------------------------
+// Routes
+// ------------------------------
 
-  const STOPWORDS = new Set([
-    "el","la","los","las","un","una","unos","unas",
-    "de","del","para","por","con","y","o","u","en","a",
-    "mi","tu","su","sus","quiero","necesito","modelo","simple",
-    "probar","prueba","imprimir","imprime","algo"
-  ]);
+// =============== CHAT ===============
+app.post("/chat-oppi", async (req, res) => {
+  try {
+    const { message, threadId } = req.body;
+    if (!message || !threadId) return res.status(400).json({ error: "Faltan datos." });
 
-  function scoreStlModel(model, query) {
-    const text = normalize(
-      (model.nombre || "") + " " +
-      (model.descripcion || "") + " " +
-      (model.categoria || "") + " " +
-      (Array.isArray(model.tags) ? model.tags.join(" ") : "")
-    );
+    const history = getThread(threadId);
+    const profileContext = profiles.has(threadId)
+      ? `\n[Contexto del perfil]\n${profiles.get(threadId).summary}\n`
+      : "";
 
-    const words = normalize(query)
-      .split(/\s+/)
-      .filter(w => w && !STOPWORDS.has(w) && w.length >= 3);
-
-    if (!words.length) return 0;
-
-    let score = 0;
-    const tags = (model.tags || []).map(t => normalize(t));
-
-    for (const w of words) {
-      if (text.includes(w)) score += 2; // match general
-      if (tags.includes(w)) score += 3;                // tag exacto
-      else if (tags.some(t => t.includes(w))) score++; // tag parcial
-    }
-
-    return score;
-  }
-
-  async function findBestStl(query) {
-    const library = await loadStlLibrary();
-    if (!library.length) return null;
-
-    const scored = library
-      .map(m => ({ ...m, score: scoreStlModel(m, query) }))
-      .filter(m => m.score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    if (!scored.length) {
-      const benchy = library.find(m => m.id === "benchy") || library[0];
-      return benchy;
-    }
-    return scored[0];
-  }
-
-  async function writeTmpIni(iniText) {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
-    const file = path.join(dir, "oppi-profile.prusa.ini");
-    await fs.writeFile(file, iniText, "utf8");
-    return file;
-  }
-
-  // ========================================================================
-  // Generador de .ini (nombres de Prusa) + sanitización bed_shape
-  // ========================================================================
-  const PARAM_KEYS = [
-    // Capas/Geometría
-    "layer_height","perimeters","top_solid_layers","bottom_solid_layers","first_layer_height",
-    // Infill
-    "fill_density","fill_pattern","fill_angle",
-    // Velocidades
-    "perimeter_speed","infill_speed","solid_infill_speed","top_solid_infill_speed",
-    "gap_fill_speed","travel_speed","first_layer_speed","bridge_speed",
-    // Temperaturas
-    "first_layer_temperature","temperature","bed_temperature","first_layer_bed_temperature",
-    // Ventilador
-    "min_fan_speed","max_fan_speed","bridge_fan_speed",
-    // Retracción
-    "retract_length","retract_speed","deretract_speed","retract_restart_extra","retract_lift",
-    // Adhesión
-    "brim_width","brim_type","skirt_distance","skirts",
-    // Filamento/Boquilla
-    "filament_diameter","extrusion_multiplier","nozzle_diameter",
-    // Impresora
-    "max_print_height","bed_shape"
-  ];
-
-  const KEY_MAP = {
-    "infill_density": "fill_density",
-    "infill_pattern": "fill_pattern",
-    "fan_speed": "min_fan_speed",
-    "fan_min_speed": "min_fan_speed",
-    "fan_max_speed": "max_fan_speed",
-    "nozzle_temperature": "temperature",
-    "lift_z": "retract_lift",
-  };
-
-  const PERCENT_KEYS = new Set(["fill_density","min_fan_speed","max_fan_speed","bridge_fan_speed"]);
-
-  function normalizeParams(raw = {}) {
-    const out = {};
-    for (const [k, v] of Object.entries(raw)) out[KEY_MAP[k] || k] = v;
-
-    if (raw.fan_speed != null) {
-      if (out.min_fan_speed == null) out.min_fan_speed = raw.fan_speed;
-      if (out.max_fan_speed == null) out.max_fan_speed = raw.fan_speed;
-    }
-
-    for (const k of Object.keys(out)) {
-      let val = out[k];
-      if (typeof val === "string" && val.trim() && !val.trim().endsWith("%") && !isNaN(Number(val))) {
-        val = Number(val);
-      }
-      if (PERCENT_KEYS.has(k) && typeof val === "number") val = `${val}%`;
-      out[k] = val;
-    }
-    return out;
-  }
-
-  function sanitizeBedShape(val) {
-    if (!val) return null;
-    val = String(val).replace(/\s+/g, "");
-    const ok = /^-?\d+(\.\d+)?x-?\d+(\.\d+)?(,-?\d+(\.\d+)?x-?\d+(\.\d+)?){3,}$/i.test(val);
-    return ok ? val : null;
-  }
-  function defaultBedShapeFor(threadId) {
-    if (profiles.has(threadId)) {
-      const dat = profiles.get(threadId).data;
-      const raw = dat?.printer?.bed_shape || dat?.bed_shape;
-      const s = sanitizeBedShape(raw);
-      if (s) return s;
-    }
-    return "0x0,250x0,250x210,0x210";
-  }
-
-  function buildIniFromParams(params = {}, ctx = {}) {
-    const p = normalizeParams(params);
-
-    let bedShape = sanitizeBedShape(p.bed_shape);
-    if (!bedShape) bedShape = defaultBedShapeFor(ctx.threadId);
-    p.bed_shape = bedShape;
-
-    const filtered = {};
-    for (const k of PARAM_KEYS) {
-      const v = p[k];
-      if (v !== undefined && v !== null && v !== "") filtered[k] = v;
-    }
-
-    const GROUPS = [
-      ["; ---- Capas/Geometría", ["layer_height","first_layer_height","perimeters","top_solid_layers","bottom_solid_layers","nozzle_diameter"]],
-      ["; ---- Infill", ["fill_density","fill_pattern","fill_angle"]],
-      ["; ---- Velocidades", ["perimeter_speed","infill_speed","solid_infill_speed","top_solid_infill_speed","gap_fill_speed","first_layer_speed","bridge_speed","travel_speed"]],
-      ["; ---- Temperaturas", ["temperature","first_layer_temperature","bed_temperature","first_layer_bed_temperature"]],
-      ["; ---- Ventilador", ["min_fan_speed","max_fan_speed","bridge_fan_speed"]],
-      ["; ---- Retracción", ["retract_length","retract_speed","deretract_speed","retract_restart_extra","retract_lift"]],
-      ["; ---- Adhesión", ["brim_type","brim_width","skirt_distance","skirts"]],
-      ["; ---- Filamento/Impresora", ["filament_diameter","extrusion_multiplier","max_print_height","bed_shape"]],
+    const contents = [
+      { role: "user", parts: [{ text: SYSTEM_PROMPT + profileContext }] },
+      ...history.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
+      { role: "user", parts: [{ text: message }] }
     ];
 
-    let out = `; ============================\n; Perfil generado por Oppi\n; ============================\n\n`;
-    const printed = new Set();
+    const text = await askGemini("gemini-2.0-flash", contents);
 
-    for (const [title, keys] of GROUPS) {
-      const lines = [];
-      for (const k of keys) {
-        if (filtered[k] !== undefined) { lines.push(`${k} = ${filtered[k]}`); printed.add(k); }
-      }
-      if (lines.length) out += `${title}\n${lines.join("\n")}\n\n`;
-    }
+    pushTurn(threadId, "user", message);
+    pushTurn(threadId, "model", text || "(sin respuesta)");
 
-    const rest = Object.keys(filtered).filter(k => !printed.has(k));
-    if (rest.length) out += `; ---- Otros\n` + rest.map(k => `${k} = ${filtered[k]}`).join("\n") + "\n";
+    return res.json({ reply: text || "No pude generar respuesta." });
 
-    return out.trim() + "\n";
+  } catch (e) {
+    console.error("❌ Chat error:", e);
+    return res.status(500).json({ error: "Error al generar respuesta." });
   }
+});
 
-  function extractJson(text) {
-    try { return JSON.parse(text); } catch {}
-    const s = text.indexOf("{"), e = text.lastIndexOf("}");
-    if (s !== -1 && e !== -1 && e > s) {
-      try { return JSON.parse(text.slice(s, e + 1)); } catch {}
-    }
-    return null;
+// =============== RESET MEMORIA ===============
+app.post("/reset-thread", (req, res) => {
+  const { threadId } = req.body;
+  if (threadId) {
+    memory.delete(threadId);
+    profiles.delete(threadId);
   }
+  res.json({ ok: true });
+});
 
-  function buildHistoryText(history) {
-    if (!history || !history.length) return "";
-    let out = "";
-    for (const turn of history) {
-      const role = turn.role === "model" ? "Oppi" : "Usuario";
-      const text = turn.parts?.[0]?.text || "";
-      out += `${role}: ${text}\n`;
-    }
-    return out;
+// =============== IMPORT .INI ===============
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post("/import-ini", upload.single("file"), (req, res) => {
+  try {
+    const { threadId } = req.body;
+    if (!threadId) return res.status(400).json({ error: "Falta threadId." });
+    if (!req.file) return res.status(400).json({ error: "Falta archivo." });
+
+    const raw = req.file.buffer.toString("utf8");
+    const parsed = ini.parse(raw);
+    const summary = summarizeProfile(parsed);
+
+    profiles.set(threadId, { raw, data: parsed, summary });
+    pushTurn(threadId, "user", `Importé un perfil.\n${summary}`);
+
+    return res.json({ ok: true, summary });
+  } catch (e) {
+    console.error("❌ import .ini:", e);
+    res.status(500).json({ error: "No pude importar perfil." });
   }
+});
 
-  // ========================================================================
-  // Rutas HTTP
-  // ========================================================================
+// =============== GENERAR INI CON IA ===============
+app.post("/generate-ini-ai", async (req, res) => {
+  try {
+    const { threadId } = req.body;
+    if (!threadId) return res.status(400).json({ error: "Falta threadId." });
 
-  // Chat principal (usa prompt en texto plano)
-  app.post("/chat-oppi", async (req, res) => {
-    try {
-      const { message, threadId } = req.body || {};
-      if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
+    const ask = `
+Generame SOLO un JSON de parámetros para PrusaSlicer.
+Solo con claves reales: layer_height, perimeters, fill_density, travel_speed, temperature,
+first_layer_temperature, bed_temperature, nozzle_diameter, bed_shape, etc.
+Valores modo abuela si falta info.
+NO escribas texto fuera del JSON.
+`;
 
-      const history = getThread(threadId);
-      let profileContext = "";
-      if (profiles.has(threadId)) profileContext = `\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+    const history = getThread(threadId);
+    const contents = [
+      { role: "user", parts: [{ text: SYSTEM_PROMPT }] },
+      ...history.map(t => ({ role: t.role, parts: [{ text: t.text }] })),
+      { role: "user", parts: [{ text: ask }] }
+    ];
 
-      const historyText = buildHistoryText(history);
-
-      const prompt = `${SYSTEM}
-${profileContext}
-
-[Conversación hasta ahora]
-${historyText}
-Usuario: ${message}
-Oppi:`;
-
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: prompt
-      });
-
-      const text = response?.text ?? "No pude generar respuesta.";
-
-      pushTurn(threadId, "user", message);
-      pushTurn(threadId, "model", text);
-
-      res.json({ reply: text });
-    } catch (e) {
-      console.error("❌ Error en /chat-oppi:", e);
-      res.status(500).json({ error: "Error al generar respuesta." });
+    const raw = await askGemini("gemini-2.0-flash", contents);
+    const open = raw.indexOf("{");
+    const close = raw.lastIndexOf("}");
+    if (open === -1 || close === -1) {
+      return res.status(502).json({ error: "La IA no devolvió JSON válido." });
     }
-  });
 
-  // Reset memoria del hilo
-  app.post("/reset-thread", (req, res) => {
-    const { threadId } = req.body || {};
-    if (threadId) { memory.delete(threadId); profiles.delete(threadId); }
-    res.json({ ok: true });
-  });
+    const json = JSON.parse(raw.slice(open, close + 1));
 
-  // Sugerir STL en base a un texto
-  app.post("/api/stl/suggest", async (req, res) => {
-    try {
-      const { prompt } = req.body || {};
-      if (!prompt || !prompt.trim()) {
-        return res.status(400).json({ error: "Falta el texto de búsqueda (prompt)." });
-      }
+    let iniText = "; Oppi Profile\n\n";
+    for (const [k, v] of Object.entries(json)) iniText += `${k} = ${v}\n`;
 
-      const best = await findBestStl(prompt);
-      if (!best) {
-        return res.json({ found: false });
-      }
+    pushTurn(threadId, "model", iniText);
 
-      return res.json({
-        found: true,
-        model: best
-      });
-    } catch (e) {
-      console.error("❌ Error en /api/stl/suggest:", e);
-      res.status(500).json({ error: "No pude buscar un modelo STL." });
-    }
-  });
+    return res.json({ ok: true, iniText });
 
-  // Importar .ini (para usar como contexto)
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
-  app.post("/import-ini", upload.single("file"), async (req, res) => {
-    try {
-      const { threadId } = req.body || {};
-      if (!threadId) return res.status(400).json({ error: "Falta threadId." });
-      if (!req.file)   return res.status(400).json({ error: "Subí un archivo .ini." });
+  } catch (e) {
+    console.error("❌ generate-ini-ai:", e);
+    return res.status(500).json({ error: "No pude generar el .ini con IA." });
+  }
+});
 
-      const raw = req.file.buffer.toString("utf8");
-      const data = ini.parse(raw);
-      const summary = summarizeProfile(data);
+// =============== SUGERIR STL ===============
+app.post("/api/stl/suggest", async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.json({ found: false });
 
-      profiles.set(threadId, { raw, data, summary });
-      pushTurn(threadId, "user", `Se importó un perfil .ini.\n${summary}`);
+    const model = await bestStl(prompt);
+    if (!model) return res.json({ found: false });
 
-      res.json({ ok: true, summary });
-    } catch (e) {
-      console.error("❌ Error en /import-ini:", e);
-      res.status(500).json({ error: "No se pudo importar el .ini." });
-    }
-  });
+    return res.json({ found: true, model });
 
-  // Generar .ini con IA (prompt en texto plano)
-  app.post("/generate-ini-ai", async (req, res) => {
-    try {
-      const { threadId, overrides } = req.body || {};
-      if (!threadId) return res.status(400).json({ error: "Falta threadId." });
+  } catch (e) {
+    console.error("❌ STL error:", e);
+    return res.status(500).json({ error: "No pude buscar STL." });
+  }
+});
 
-      const history = getThread(threadId);
-      let profileContext = "";
-      if (profiles.has(threadId)) profileContext = `\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
-
-      const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
-      const historyText = buildHistoryText(history);
-
-      const prompt = `${SYSTEM}
-${profileContext}
-
-[Conversación hasta ahora]
-${historyText}
-
-Ahora, en base a todo eso, devolveme SOLO un JSON válido (sin markdown, sin comentarios) con parámetros de impresión para PrusaSlicer usando SOLO estas claves: [${schemaList}].
-Usá valores seguros "Modo Abuela" si falta info.`;
-
-      const resp = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: prompt
-      });
-
-      const raw = resp?.text ?? "";
-      const json = extractJson(raw);
-      if (!json) {
-        console.error("❌ La IA no devolvió JSON válido. Respuesta cruda:", raw);
-        return res.status(502).json({ error: "La IA no devolvió JSON válido." });
-      }
-
-      const params = { ...json, ...(overrides || {}) };
-      const iniText = buildIniFromParams(params, { threadId });
-
-      res.json({ ok: true, params: normalizeParams(params), iniText });
-    } catch (e) {
-      console.error("❌ Error en /generate-ini-ai:", e);
-      res.status(500).json({ error: "No pude generar el .ini con IA." });
-    }
-  });
-
-  // Abrir en PrusaSlicer (solo útil localmente)
-  app.post("/open-prusa", async (req, res) => {
-    try {
-      const prusaPath = process.env.PRUSASLICER_PATH;
-      if (!prusaPath) {
-        return res.status(400).json({
-          error: "PRUSASLICER_PATH no está configurado (esta acción solo funciona localmente)."
-        });
-      }
-      const { iniText, iniPath } = req.body || {};
-      if (!iniText && !iniPath) return res.status(400).json({ error: "Falta iniText o iniPath." });
-
-      let fileToLoad = iniPath;
-      if (!fileToLoad) fileToLoad = await writeTmpIni(iniText);
-
-      const child = spawn(prusaPath, ["--load", fileToLoad], { detached: true, stdio: "ignore" });
-      child.unref();
-      res.json({ ok: true, loaded: fileToLoad });
-    } catch (e) {
-      console.error("❌ Error en /open-prusa:", e);
-      res.status(500).json({ error: "No pude abrir PrusaSlicer con ese .ini." });
-    }
-  });
-
-  // ========================================================================
-  // Iniciar servidor
-  // ========================================================================
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`🧠 Oppi activo en puerto ${PORT}`);
-  });
-}
+// =============== SERVIDOR ===============
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Oppi Backend v2 corriendo en puerto ${PORT}`);
+});
