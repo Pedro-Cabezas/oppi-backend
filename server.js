@@ -135,6 +135,7 @@ if (globalThis.__OPPI_STARTED__) {
   }
 
    // Normalizar: minúsculas + sin tildes
+    // Normalizar: minúsculas + sin tildes
   function normalize(str = "") {
     return String(str)
       .toLowerCase()
@@ -146,7 +147,7 @@ if (globalThis.__OPPI_STARTED__) {
     "el","la","los","las","un","una","unos","unas",
     "de","del","para","por","con","y","o","u","en","a",
     "mi","tu","su","sus","quiero","necesito","modelo","simple",
-    "probar","prueba","imprimir","imprime","algo","un","una"
+    "probar","prueba","imprimir","imprime","algo"
   ]);
 
   function scoreStlModel(model, query) {
@@ -169,11 +170,11 @@ if (globalThis.__OPPI_STARTED__) {
       if (text.includes(w)) score += 2; // match general
     }
 
-    // Bonus: matches en tags exactos o casi exactos
+    // Bonus: matches en tags
     const tags = (model.tags || []).map(t => normalize(t));
     for (const w of words) {
-      if (tags.includes(w)) score += 3;                // match exacto
-      else if (tags.some(t => t.includes(w))) score++; // match parcial
+      if (tags.includes(w)) score += 3;                // exacto
+      else if (tags.some(t => t.includes(w))) score++; // parcial
     }
 
     return score;
@@ -188,7 +189,7 @@ if (globalThis.__OPPI_STARTED__) {
       .filter(m => m.score > 0)
       .sort((a, b) => b.score - a.score);
 
-    // Si nada tiene score > 0, devolvemos Benchy como modelo de test
+    // si nada matchea, devolvemos Benchy como “modelo test”
     if (!scored.length) {
       const benchy = library.find(m => m.id === "benchy") || library[0];
       return benchy;
@@ -196,6 +197,7 @@ if (globalThis.__OPPI_STARTED__) {
 
     return scored[0];
   }
+
 
 
   
@@ -492,6 +494,7 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
 
 
 
