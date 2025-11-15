@@ -40,7 +40,10 @@ if (globalThis.__OPPI_STARTED__) {
   // Express + Gemini
   // ========================================================================
   const app = express();
-  const ai  = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  const ai  = new GoogleGenAI({});
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY no está definido en las variables de entorno.");
+}
 
   // ---------- CORS: permitimos localhost y TU GitHub Pages ----------
   const ALLOWED_ORIGINS = [
@@ -344,7 +347,7 @@ if (globalThis.__OPPI_STARTED__) {
   // ========================================================================
 
   // Chat principal
-  app.post("/chat-oppi", async (req, res) => {
+    app.post("/chat-oppi", async (req, res) => {
     try {
       const { message, threadId } = req.body || {};
       if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
@@ -359,7 +362,11 @@ if (globalThis.__OPPI_STARTED__) {
         { role: "user", parts: [{ text: message }] }
       ];
 
-      const response = await ai.models.generateContent({ model: "gemini-2.5-flash", contents });
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents
+      });
+
       const text = response?.text ?? "No pude generar respuesta.";
 
       pushTurn(threadId, "user", message);
@@ -367,10 +374,11 @@ if (globalThis.__OPPI_STARTED__) {
 
       res.json({ reply: text });
     } catch (e) {
-      console.error(e);
+      console.error("❌ Error en /chat-oppi:", e?.response?.data || e?.message || e);
       res.status(500).json({ error: "Error al generar respuesta." });
     }
   });
+
 
   // Reset memoria del hilo
   app.post("/reset-thread", (req, res) => {
@@ -426,7 +434,7 @@ if (globalThis.__OPPI_STARTED__) {
   });
 
   // Generar .ini con IA
-  app.post("/generate-ini-ai", async (req, res) => {
+    app.post("/generate-ini-ai", async (req, res) => {
     try {
       const { threadId, overrides } = req.body || {};
       if (!threadId) return res.status(400).json({ error: "Falta threadId." });
@@ -447,7 +455,11 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
         { role: "user", parts: [{ text: askJson }] }
       ];
 
-      const resp = await ai.models.generateContent({ model: "gemini-2.5-flash", contents });
+      const resp = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents
+      });
+
       const raw = resp?.text ?? "";
       const json = extractJson(raw);
       if (!json) return res.status(502).json({ error: "La IA no devolvió JSON válido." });
@@ -457,7 +469,7 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
 
       res.json({ ok: true, params: normalizeParams(params), iniText });
     } catch (e) {
-      console.error(e);
+      console.error("❌ Error en /generate-ini-ai:", e?.response?.data || e?.message || e);
       res.status(500).json({ error: "No pude generar el .ini con IA." });
     }
   });
@@ -494,6 +506,7 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
 
 
 
