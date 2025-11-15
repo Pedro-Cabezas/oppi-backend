@@ -319,6 +319,19 @@ async function bestStl(prompt) {
   return matches[0] || null;
 }
 
+function describeStlLibraryForAi(lib) {
+  return lib.map((m, i) => {
+    const tags = Array.isArray(m.tags) ? m.tags.join(", ") : "";
+    return `#${i + 1}
+archivo: ${m.archivo}
+nombre: ${m.nombre}
+descripcion: ${m.descripcion}
+categoria: ${m.categoria}
+dificultad: ${m.dificultad}
+tags: ${tags}`;
+  }).join("\n\n");
+}
+
 // ------------------------------
 // Rutas
 // ------------------------------
@@ -448,6 +461,88 @@ app.post("/api/stl/suggest", async (req, res) => {
   }
 });
 
+// SUGERIR STL usando IA + historial de conversación
+app.post("/api/stl/suggest-ai", async (req, res) => {
+  try {
+    const { threadId } = req.body || {};
+    if (!threadId) {
+      return res.status(400).json({ ok: false, error: "Falta threadId." });
+    }
+
+    const history = getThread(threadId);
+    const lib = await loadStlLibrary();
+    if (!lib.length) {
+      return res.json({ ok: false, error: "Biblioteca STL vacía." });
+    }
+
+    const libDesc = describeStlLibraryForAi(lib);
+
+    const ask = `
+Tenés esta conversación previa con el usuario sobre impresión 3D y esta biblioteca de modelos STL.
+Elegí EL MEJOR modelo STL de la lista para que imprima ahora.
+
+Devolvé EXCLUSIVAMENTE un JSON válido con esta forma:
+
+{
+  "archivo": "nombre_del_archivo.stl",
+  "nombre": "Nombre legible del modelo",
+  "motivo": "Texto corto explicando por qué lo elegiste"
+}
+
+Usá SIEMPRE un valor de "archivo" que esté EXACTAMENTE en el campo "archivo" de alguno de los modelos listados.
+
+Biblioteca de modelos:
+
+${libDesc}
+`;
+
+    const contents = [
+      { role: "user", parts: [{ text: SYSTEM }] },
+      ...history.map(t => ({
+        role: t.role === "model" ? "model" : "user",
+        parts: [{ text: t.text }]
+      })),
+      { role: "user", parts: [{ text: ask }] }
+    ];
+
+    const raw = await askGemini("gemini-2.0-flash", contents);
+    if (!raw) {
+      console.error("❌ STL AI: IA no devolvió texto");
+      return res.status(502).json({ ok: false, error: "La IA no devolvió contenido." });
+    }
+
+    const json = extractJsonFromText(raw);
+    if (!json || !json.archivo) {
+      console.error("❌ STL AI sin JSON válido. Respuesta cruda:\n", raw);
+
+      // Fallback: usar algún modelo por defecto (benchy o el primero)
+      const fallback = await bestStl("benchy") || lib[0];
+      return res.json({
+        ok: true,
+        model: fallback,
+        motivo: "Usé un modelo de prueba por defecto porque la IA no respondió con un JSON válido."
+      });
+    }
+
+    // Buscar en la biblioteca el archivo elegido
+    const model =
+      lib.find(m => m.archivo === json.archivo) ||
+      (await bestStl(json.nombre || json.motivo || json.archivo)) ||
+      lib[0];
+
+    return res.json({
+      ok: true,
+      model,
+      motivo: json.motivo || null
+    });
+
+  } catch (err) {
+    console.error("❌ STL AI error:", err);
+    return res.status(500).json({ ok: false, error: "No pude elegir un STL con IA." });
+  }
+});
+
+
 // (Opcional) ABRIR en PrusaSlicer local
 app.post("/open-prusa", async (req, res) => {
   try {
@@ -482,4 +577,5 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
 
