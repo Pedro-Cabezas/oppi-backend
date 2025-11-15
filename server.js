@@ -513,16 +513,17 @@ ${libDesc}
 
     const json = extractJsonFromText(raw);
     if (!json || !json.archivo) {
-      console.error("❌ STL AI sin JSON válido. Respuesta cruda:\n", raw);
+  console.error("❌ STL AI sin JSON válido. Respuesta cruda:\n", raw);
 
-      // Fallback: usar algún modelo por defecto (benchy o el primero)
-      const fallback = await bestStl("benchy") || lib[0];
-      return res.json({
-        ok: true,
-        model: fallback,
-        motivo: "Usé un modelo de prueba por defecto porque la IA no respondió con un JSON válido."
-      });
-    }
+  // Fallback: simplemente usar el primer modelo de la biblioteca
+  const fallback = lib[0];
+  return res.json({
+    ok: true,
+    model: fallback,
+    motivo: "Usé un modelo de la biblioteca por defecto porque la IA no respondió con un JSON válido."
+  });
+}
+
 
     // Buscar en la biblioteca el archivo elegido
     const model =
@@ -577,5 +578,6 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
 
 
