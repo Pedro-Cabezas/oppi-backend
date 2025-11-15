@@ -40,7 +40,9 @@ if (globalThis.__OPPI_STARTED__) {
   // Express + Gemini
   // ========================================================================
   const app = express();
-  const ai  = new GoogleGenAI({});
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
+
 if (!process.env.GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY no está definido en las variables de entorno.");
 }
@@ -348,36 +350,34 @@ if (!process.env.GEMINI_API_KEY) {
 
   // Chat principal
     app.post("/chat-oppi", async (req, res) => {
-    try {
-      const { message, threadId } = req.body || {};
-      if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
+  try {
+    const { message, threadId } = req.body || {};
+    if (!message || !threadId) return res.status(400).json({ error: "Falta message o threadId." });
 
-      const history = getThread(threadId);
-      let profileContext = "";
-      if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+    const history = getThread(threadId);
+    let profileContext = "";
+    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
-      const contents = [
-        { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-        ...history,
-        { role: "user", parts: [{ text: message }] }
-      ];
+    const contents = [
+      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
+      ...history,
+      { role: "user", parts: [{ text: message }] }
+    ];
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents
-      });
+    // ⭐ Nueva llamada correcta
+    const result = await model.generateContent({ contents });
+    const text = result.response.text();
 
-      const text = response?.text ?? "No pude generar respuesta.";
+    pushTurn(threadId, "user", message);
+    pushTurn(threadId, "model", text);
 
-      pushTurn(threadId, "user", message);
-      pushTurn(threadId, "model", text);
+    res.json({ reply: text });
+  } catch (e) {
+    console.error("❌ Error en /chat-oppi:", e);
+    res.status(500).json({ error: "Error al generar respuesta." });
+  }
+});
 
-      res.json({ reply: text });
-    } catch (e) {
-      console.error("❌ Error en /chat-oppi:", e?.response?.data || e?.message || e);
-      res.status(500).json({ error: "Error al generar respuesta." });
-    }
-  });
 
 
   // Reset memoria del hilo
@@ -435,44 +435,43 @@ if (!process.env.GEMINI_API_KEY) {
 
   // Generar .ini con IA
     app.post("/generate-ini-ai", async (req, res) => {
-    try {
-      const { threadId, overrides } = req.body || {};
-      if (!threadId) return res.status(400).json({ error: "Falta threadId." });
+  try {
+    const { threadId, overrides } = req.body || {};
+    if (!threadId) return res.status(400).json({ error: "Falta threadId." });
 
-      const history = getThread(threadId);
-      let profileContext = "";
-      if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+    const history = getThread(threadId);
+    let profileContext = "";
+    if (profiles.has(threadId)) profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
 
-      const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
-      const askJson = `
+    const schemaList = PARAM_KEYS.map(k => `"${k}"`).join(", ");
+    const askJson = `
 Quiero un JSON con parámetros de impresión para PrusaSlicer usando SOLO estas claves: [${schemaList}].
-Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin markdown, sin comentarios).
-`;
+Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido.
+    `;
 
-      const contents = [
-        { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-        ...history,
-        { role: "user", parts: [{ text: askJson }] }
-      ];
+    const contents = [
+      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
+      ...history,
+      { role: "user", parts: [{ text: askJson }] }
+    ];
 
-      const resp = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents
-      });
+    // ⭐ Nueva llamada correcta
+    const result = await model.generateContent({ contents });
+    const raw = result.response.text();
 
-      const raw = resp?.text ?? "";
-      const json = extractJson(raw);
-      if (!json) return res.status(502).json({ error: "La IA no devolvió JSON válido." });
+    const json = extractJson(raw);
+    if (!json) return res.status(502).json({ error: "La IA no devolvió JSON válido." });
 
-      const params = { ...json, ...(overrides || {}) };
-      const iniText = buildIniFromParams(params, { threadId });
+    const params = { ...json, ...(overrides || {}) };
+    const iniText = buildIniFromParams(params, { threadId });
 
-      res.json({ ok: true, params: normalizeParams(params), iniText });
-    } catch (e) {
-      console.error("❌ Error en /generate-ini-ai:", e?.response?.data || e?.message || e);
-      res.status(500).json({ error: "No pude generar el .ini con IA." });
-    }
-  });
+    res.json({ ok: true, params: normalizeParams(params), iniText });
+  } catch (e) {
+    console.error("❌ Error en /generate-ini-ai:", e);
+    res.status(500).json({ error: "No pude generar el .ini con IA." });
+  }
+});
+
 
   // Abrir en PrusaSlicer (solo útil localmente)
   app.post("/open-prusa", async (req, res) => {
@@ -506,6 +505,7 @@ Valores seguros "Modo Abuela" si falta info. Respondé SOLO JSON válido (sin ma
     console.log(`🧠 Oppi activo en puerto ${PORT}`);
   });
 }
+
 
 
 
