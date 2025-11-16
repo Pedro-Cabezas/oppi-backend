@@ -587,12 +587,15 @@ async function updateConversationSummary(conversationId) {
 
 // CHAT — ahora ligado a Supabase por cuenta + resumen por conversación
 // CHAT
-app.post("/chat-oppi", async (req, res) => {
+// CHAT
+app.post("/chat-oppi", requireSupabaseUser, async (req, res) => {
   try {
     const { message, threadId } = req.body || {};
     if (!message || !threadId) {
       return res.status(400).json({ error: "Falta message o threadId." });
     }
+
+    const userId = req.supabaseUser.id; // viene del middleware
 
     const history = getThread(threadId);
 
@@ -602,25 +605,25 @@ app.post("/chat-oppi", async (req, res) => {
     }
 
     const contents = [
-      // Sistema / contexto
       { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-      // Historial corto
       ...history.map((t) => ({
         role: t.role === "model" ? "model" : "user",
         parts: [{ text: t.text }],
       })),
-      // Mensaje actual del usuario
       { role: "user", parts: [{ text: message }] },
     ];
 
-    // Usamos el mismo modelo que en generate-ini (que ya sabés que anda)
     const text = await askGemini("gemini-2.5-flash", contents);
 
-    // Guardar en memoria interna del backend
+    // Guardar en memoria en RAM
     pushTurn(threadId, "user", message);
     pushTurn(threadId, "model", text || "(sin respuesta)");
 
-    // Si la IA no devolvió nada, devolvemos un fallback amable pero 200 OK
+    // 🔹 Guardar snapshot en Supabase (async, sin bloquear la respuesta al usuario)
+    saveThreadSnapshot({ userId, threadId }).catch((e) =>
+      console.error("❌ Error en saveThreadSnapshot:", e)
+    );
+
     if (!text) {
       console.warn("⚠️ Gemini no devolvió texto en /chat-oppi");
       return res.json({
@@ -635,6 +638,7 @@ app.post("/chat-oppi", async (req, res) => {
     res.status(500).json({ error: "Error al generar respuesta." });
   }
 });
+
 
 
 // RESET hilo — limpia RAM y mensajes/summary en DB de ese thread
@@ -682,6 +686,55 @@ app.post("/reset-thread", requireSupabaseUser, async (req, res) => {
     res.status(500).json({ error: "No se pudo resetear el hilo." });
   }
 });
+
+function buildSimpleSummary(history) {
+  if (!history || !history.length) return null;
+
+  // Nos quedamos con los mensajes del usuario
+  const userMsgs = history
+    .filter(m => m.role === "user")
+    .map(m => m.text);
+
+  if (!userMsgs.length) return null;
+
+  // Tomamos los últimos 3 textos del usuario y los recortamos
+  const joined = userMsgs.slice(-3).join(" | ");
+  return joined.length > 280 ? joined.slice(0, 277) + "..." : joined;
+}
+
+async function saveThreadSnapshot({ userId, threadId }) {
+  try {
+    const history = memory.get(threadId) || [];
+    const summary = buildSimpleSummary(history);
+
+    // Últimos 3 mensajes (user/model) para mostrar rápido
+    const lastMessages = history.slice(-3);
+
+    // Buscamos el nombre del hilo desde el frontend (si no, uno genérico)
+    const name = `Conversación Oppi`;
+
+    const { error } = await supabaseAdmin
+      .from("oppi_threads")
+      .upsert(
+        {
+          id: threadId,
+          user_id: userId,
+          name,
+          summary,
+          last_messages: lastMessages,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "id" } // si existe, actualiza
+      );
+
+    if (error) {
+      console.error("❌ Error guardando oppi_threads:", error);
+    }
+  } catch (err) {
+    console.error("❌ saveThreadSnapshot error:", err);
+  }
+}
+
 
 // IMPORTAR .ini
 const upload = multer({
@@ -923,4 +976,5 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
 
