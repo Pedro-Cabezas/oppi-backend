@@ -29,3 +29,23 @@ export async function requireSupabaseUser(req, res, next) {
     return res.status(500).json({ error: "Error interno de autenticación" });
   }
 }
+
+// Middleware: lee el token Bearer de Supabase y obtiene el usuario
+async function requireSupabaseUser(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [, token] = authHeader.split(" ");
+
+  if (!token) {
+    return res.status(401).json({ error: "Falta token de Supabase" });
+  }
+
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user) {
+    console.error("Error getUser Supabase:", error);
+    return res.status(401).json({ error: "Token inválido" });
+  }
+
+  req.supabaseUser = data.user;
+  next();
+}
+
