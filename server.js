@@ -22,6 +22,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { GoogleGenAI } from "@google/genai";
+import { requireSupabaseUser } from "./authMiddleware.js";
 
 dotenv.config();
 
@@ -72,6 +73,8 @@ function extractJsonFromText(raw) {
 // ------------------------------
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
+
 
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
@@ -566,6 +569,14 @@ app.post("/open-prusa", async (req, res) => {
   }
 });
 
+app.get("/api/me", requireSupabaseUser, (req, res) => {
+  res.json({
+    id: req.supabaseUser.id,
+    email: req.supabaseUser.email,
+  });
+});
+
+
 // ------------------------------
 // Iniciar servidor
 // ------------------------------
@@ -578,6 +589,7 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
 
 
 
