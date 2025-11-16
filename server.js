@@ -129,6 +129,68 @@ function pushTurn(threadId, role, text) {
   while (thread.length > MAX_TURNS) thread.shift();
 }
 
+app.post("/api/threads/rename", requireSupabaseUser, async (req, res) => {
+  try {
+    const { threadId, name } = req.body || {};
+    if (!threadId || !name) {
+      return res.status(400).json({ error: "Falta threadId o name." });
+    }
+
+    const userId = req.supabaseUser.id;
+
+    // Actualizar en Supabase (si existe)
+    const { error } = await supabaseAdmin
+      .from("oppi_threads")
+      .update({
+        name,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", threadId)
+      .eq("user_id", userId);
+
+    if (error) {
+      console.error("❌ Error renombrando oppi_threads:", error);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ rename thread error:", err);
+    res.status(500).json({ error: "No pude renombrar la conversación." });
+  }
+});
+
+app.post("/api/threads/delete", requireSupabaseUser, async (req, res) => {
+  try {
+    const { threadId } = req.body || {};
+    if (!threadId) {
+      return res.status(400).json({ error: "Falta threadId." });
+    }
+
+    const userId = req.supabaseUser.id;
+
+    // Borrar en Supabase (si existe)
+    const { error } = await supabaseAdmin
+      .from("oppi_threads")
+      .delete()
+      .eq("id", threadId)
+      .eq("user_id", userId);
+
+    if (error) {
+      console.error("❌ Error borrando oppi_threads:", error);
+    }
+
+    // Limpiar memoria en RAM del backend
+    memory.delete(threadId);
+    profiles.delete(threadId);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ delete thread error:", err);
+    res.status(500).json({ error: "No pude borrar la conversación." });
+  }
+});
+
+
 // ------------------------------
 // Sistema / Prompt de Oppi
 // ------------------------------
@@ -976,5 +1038,6 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
 
 
