@@ -1,1043 +1,925 @@
-// ============================================================================
-// Oppi Backend — Chat + Memoria + Import/Generar .ini + STL + Supabase
-// Versión: GoogleGenAI (@google/genai 1.4.0)
-// ============================================================================
+// ────────────────────────────────────────────────────────────────
+// Configuración de API
+const API_BASE = "https://oppi-backend.onrender.com";
+// const API_BASE = "";
 
-process.on("uncaughtException", (e) => {
-  console.error("❌ uncaughtException:", e);
+// ────────────────────────────────────────────────────────────────
+// Supabase (Auth)
+import { createClient } from "https://esm.sh/@supabase/supabase-js";
+
+const supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+window.supabase = supabase;
+
+// Helper para llamar a backend con token
+async function callBackend(path, options = {}) {
+  const {
+    data: { session },
+    error,
+  } = await supabase.auth.getSession();
+
+  if (error) {
+    console.error("Error obteniendo sesión:", error);
+    throw new Error("Error al obtener la sesión");
+  }
+
+  if (!session) {
+    throw new Error("No hay sesión activa (usuario no logueado)");
+  }
+
+  const token = session.access_token;
+  const isFormData = options.body instanceof FormData;
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${token}`,
+      ...(isFormData ? {} : { "Content-Type": "application/json" }),
+    },
+  });
+
+  const body = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    console.error("Error backend:", body);
+    throw new Error(body.error || "Error en el backend");
+  }
+
+  return body;
+}
+
+// ────────────────────────────────────────────────────────────────
+// Estado de sesión / elementos de autenticación
+let currentUser = null;
+
+// DOM general
+const box = document.getElementById("chat-box");
+const form = document.getElementById("chat-form");
+const input = document.getElementById("user-input");
+const resetBtn = document.getElementById("reset-btn");
+const importBtn = document.getElementById("import-btn");
+const iniFile = document.getElementById("ini-file");
+const generateBtn = document.getElementById("generate-ini-btn");
+const openIniFile = document.getElementById("open-ini-prusa-file");
+const openIniBtn = document.getElementById("open-ini-prusa-btn");
+
+// Sidebar
+const threadList = document.getElementById("thread-list");
+const newThreadBtn = document.getElementById("new-thread-btn");
+
+// Auth modal
+const authOpenBtn = document.getElementById("auth-open-btn");
+const authModal = document.getElementById("auth-modal");
+const authCloseBtn = document.getElementById("auth-close-btn");
+
+// UI usuario logueado
+const authUserInfo = document.getElementById("auth-user-info");
+const authUserLabel = document.getElementById("auth-user-label");
+const authLogoutBtn = document.getElementById("auth-logout-btn");
+
+// STL
+const suggestStlBtn = document.getElementById("suggest-stl-btn");
+
+// Auth inputs
+const registerEmail = document.getElementById("register-email");
+const registerPassword = document.getElementById("register-password");
+const registerBtn = document.getElementById("register-btn");
+const registerStatus = document.getElementById("register-status");
+
+const loginEmail = document.getElementById("login-email");
+const loginPassword = document.getElementById("login-password");
+const loginBtn = document.getElementById("login-btn");
+const loginStatus = document.getElementById("login-status");
+
+const btnVerCuenta = document.getElementById("btn-ver-cuenta");
+const meOutput = document.getElementById("me-output");
+
+// ────────────────────────────────────────────────────────────────
+// Modal de autenticación
+
+function openAuthModal() {
+  authModal?.classList.add("open");
+}
+
+function closeAuthModal() {
+  authModal?.classList.remove("open");
+}
+
+authOpenBtn?.addEventListener("click", () => openAuthModal());
+authCloseBtn?.addEventListener("click", () => closeAuthModal());
+
+authModal?.addEventListener("click", (e) => {
+  if (e.target === authModal) closeAuthModal();
 });
-process.on("unhandledRejection", (e) => {
-  console.error("❌ unhandledRejection:", e);
-});
 
-console.log("🚀 Boot Oppi: iniciando server.js...");
+// ────────────────────────────────────────────────────────────────
+// Manejo de sesión
 
-// ------------------------------
-// Imports
-// ------------------------------
-import express from "express";
-import dotenv from "dotenv";
-import cors from "cors";
-import multerPkg from "multer";
-const multer = multerPkg.default ?? multerPkg; // compat ESM/CJS
-import ini from "ini";
-import fs from "node:fs/promises";
-import path from "node:path";
-import os from "node:os";
-import { spawn } from "node:child_process";
-import { GoogleGenAI } from "@google/genai";
-import { createClient as createSupabaseClient } from "@supabase/supabase-js";
-import { requireSupabaseUser } from "./authMiddleware.js";
+function updateAuthUI() {
+  if (currentUser) {
+    authOpenBtn?.classList.add("hidden");
+    authUserInfo?.classList.remove("hidden");
+    if (authUserLabel) authUserLabel.textContent = currentUser.email || "Usuario";
+  } else {
+    authOpenBtn?.classList.remove("hidden");
+    authUserInfo?.classList.add("hidden");
+    if (authUserLabel) authUserLabel.textContent = "";
+  }
+}
 
-dotenv.config();
-
-// ------------------------------
-// Supabase (backend / admin)
-// ------------------------------
-const supabaseAdmin = createSupabaseClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-// ------------------------------
-// IA: GoogleGenAI
-// ------------------------------
-// ------------------------------
-// IA: GoogleGenAI
-// ------------------------------
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-async function askGemini(modelName, contents) {
+async function syncThreadsFromBackend() {
+  // Opcional: si no existe /api/threads/list, esto fallará y lo ignoramos
   try {
-    const result = await ai.models.generateContent({
-      model: modelName,
-      contents,
+    const data = await callBackend("/api/threads/list", {
+      method: "GET",
     });
 
-    return (
-      result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null
-    );
-  } catch (err) {
-    console.error("❌ Error llamando a Gemini:", err?.message, err);
-    // Devolvemos null para que la ruta maneje el fallback sin tirar 500
-    return null;
-  }
-}
+    if (!data || !Array.isArray(data.threads)) return;
 
+    threads = {};
+    for (const t of data.threads) {
+      threads[t.threadId] = {
+        name: t.name || "Chat sin título",
+        created: t.createdAt ? new Date(t.createdAt).getTime() : Date.now(),
+      };
+    }
+    saveThreads(threads);
 
-// Helper robusto para extraer JSON desde la respuesta de la IA
-function extractJsonFromText(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  let text = raw.trim();
-
-  // 1) Si viene dentro de ``` ``` o ```json ```
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced && fenced[1]) {
-    text = fenced[1].trim();
-  }
-
-  // 2) Recortar desde el primer { hasta el último }
-  const s = text.indexOf("{");
-  const e = text.lastIndexOf("}");
-  if (s === -1 || e === -1 || e <= s) return null;
-
-  const candidate = text.slice(s, e + 1);
-  try {
-    return JSON.parse(candidate);
-  } catch (err) {
-    console.error("❌ No pude parsear JSON:", err, "\nTexto candidato:\n", candidate);
-    return null;
-  }
-}
-
-// ------------------------------
-// Express + CORS
-// ------------------------------
-const app = express();
-app.use(express.json({ limit: "2mb" }));
-
-const ALLOWED_ORIGINS = [
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:3000",
-  "https://pedro-cabezas.github.io",
-  "https://pedro-cabezas.github.io/opifex",
-];
-app.use(
-  cors({
-    origin: ALLOWED_ORIGINS,
-    methods: ["GET", "POST"],
-    credentials: false,
-  })
-);
-
-// ------------------------------
-// Memoria en RAM (por threadId) + perfiles .ini
-// ------------------------------
-const memory = new Map(); // threadId -> [{ role, text }]
-const profiles = new Map(); // threadId -> { raw, data, summary }
-const MAX_TURNS = 12;
-
-function getThread(threadId) {
-  if (!memory.has(threadId)) memory.set(threadId, []);
-  return memory.get(threadId);
-}
-
-function pushTurn(threadId, role, text) {
-  const thread = getThread(threadId);
-  thread.push({ role, text });
-  while (thread.length > MAX_TURNS) thread.shift();
-}
-
-app.post("/api/threads/rename", requireSupabaseUser, async (req, res) => {
-  try {
-    const { threadId, name } = req.body || {};
-    if (!threadId || !name) {
-      return res.status(400).json({ error: "Falta threadId o name." });
+    const ids = Object.keys(threads);
+    if (!threads[threadId] && ids.length > 0) {
+      threadId = ids[0];
+      localStorage.setItem(CURRENT_KEY, threadId);
     }
 
-    const userId = req.supabaseUser.id;
-
-    // Actualizar en Supabase (si existe)
-    const { error } = await supabaseAdmin
-      .from("oppi_threads")
-      .update({
-        name,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", threadId)
-      .eq("user_id", userId);
-
-    if (error) {
-      console.error("❌ Error renombrando oppi_threads:", error);
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("❌ rename thread error:", err);
-    res.status(500).json({ error: "No pude renombrar la conversación." });
-  }
-});
-
-app.post("/api/threads/delete", requireSupabaseUser, async (req, res) => {
-  try {
-    const { threadId } = req.body || {};
-    if (!threadId) {
-      return res.status(400).json({ error: "Falta threadId." });
-    }
-
-    const userId = req.supabaseUser.id;
-
-    // Borrar en Supabase (si existe)
-    const { error } = await supabaseAdmin
-      .from("oppi_threads")
-      .delete()
-      .eq("id", threadId)
-      .eq("user_id", userId);
-
-    if (error) {
-      console.error("❌ Error borrando oppi_threads:", error);
-    }
-
-    // Limpiar memoria en RAM del backend
-    memory.delete(threadId);
-    profiles.delete(threadId);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("❌ delete thread error:", err);
-    res.status(500).json({ error: "No pude borrar la conversación." });
-  }
-});
-
-
-// ------------------------------
-// Sistema / Prompt de Oppi
-// ------------------------------
-const SYSTEM = `Sos Oppi, asistente experto en impresión 3D (PrusaSlicer/OctoPrint).
-- Español rioplatense, claro y amable.
-- Cuando el usuario pida un perfil, devolvelo SIEMPRE dentro de un bloque \`\`\`ini ... \`\`\` como Config Bundle válido ([print], [filament], [printer]) sin texto fuera del bloque.
-- Si hay ambigüedad, hacé 1-2 preguntas de seguimiento muy concretas.
-- Recordá el contexto reciente (pieza, material, impresora) y retomalo.`;
-
-// ------------------------------
-// Helpers para resumen de perfil .ini
-// ------------------------------
-const pick = (obj, keys) => {
-  const o = {};
-  for (const k of keys)
-    if (obj && Object.prototype.hasOwnProperty.call(obj, k)) o[k] = obj[k];
-  return o;
-};
-
-function summarizeProfile(iniData) {
-  const print = iniData.print || iniData.Print || {};
-  const filament = iniData.filament || iniData.Filament || {};
-  const printer = iniData.printer || iniData.Printer || {};
-
-  const corePrint = pick(print, [
-    "layer_height",
-    "perimeters",
-    "top_solid_layers",
-    "bottom_solid_layers",
-    "fill_density",
-    "fill_pattern",
-    "fill_angle",
-    "perimeter_speed",
-    "infill_speed",
-    "solid_infill_speed",
-    "top_solid_infill_speed",
-    "gap_fill_speed",
-    "travel_speed",
-    "first_layer_speed",
-    "bridge_speed",
-  ]);
-  const coreTemp = pick(filament, [
-    "temperature",
-    "first_layer_temperature",
-    "bed_temperature",
-    "first_layer_bed_temperature",
-  ]);
-  const coreFan = pick(filament, [
-    "min_fan_speed",
-    "max_fan_speed",
-    "bridge_fan_speed",
-  ]);
-  const corePrinter = pick(printer, [
-    "nozzle_diameter",
-    "max_print_height",
-    "bed_shape",
-  ]);
-
-  const lines = [];
-  lines.push("**Resumen de perfil importado**");
-  if (Object.keys(coreTemp).length)
-    lines.push("— **Temperaturas**: " + JSON.stringify(coreTemp));
-  if (Object.keys(coreFan).length)
-    lines.push("— **Ventilador**: " + JSON.stringify(coreFan));
-  if (Object.keys(corePrint).length)
-    lines.push("— **Impresión/Velocidades**: " + JSON.stringify(corePrint));
-  if (Object.keys(corePrinter).length)
-    lines.push("— **Impresora**: " + JSON.stringify(corePrinter));
-  if (lines.length === 1)
-    lines.push("Secciones detectadas: " + JSON.stringify(Object.keys(iniData)));
-  return lines.join("\n");
-}
-
-async function writeTmpIni(iniText) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oppi-"));
-  const file = path.join(dir, "oppi-profile.prusa.ini");
-  await fs.writeFile(file, iniText, "utf8");
-  return file;
-}
-
-// ------------------------------
-// Generador de .ini — PARAM_KEYS, normalización, bed_shape
-// ------------------------------
-const PARAM_KEYS = [
-  // capas/geometría
-  "layer_height",
-  "perimeters",
-  "top_solid_layers",
-  "bottom_solid_layers",
-  "first_layer_height",
-  // densidad/patrón
-  "fill_density",
-  "fill_pattern",
-  "fill_angle",
-  // velocidades
-  "perimeter_speed",
-  "infill_speed",
-  "solid_infill_speed",
-  "top_solid_infill_speed",
-  "gap_fill_speed",
-  "travel_speed",
-  "first_layer_speed",
-  "bridge_speed",
-  // temperaturas
-  "first_layer_temperature",
-  "temperature",
-  "bed_temperature",
-  "first_layer_bed_temperature",
-  // ventilador
-  "min_fan_speed",
-  "max_fan_speed",
-  "bridge_fan_speed",
-  // retracción
-  "retract_length",
-  "retract_speed",
-  "deretract_speed",
-  "retract_restart_extra",
-  "retract_lift",
-  // adhesión
-  "brim_width",
-  "brim_type",
-  "skirt_distance",
-  "skirts",
-  // filamento/boquilla
-  "filament_diameter",
-  "extrusion_multiplier",
-  "nozzle_diameter",
-  // impresora/volumen cama
-  "max_print_height",
-  "bed_shape",
-];
-
-const KEY_MAP = {
-  // infill
-  infill_density: "fill_density",
-  infill_pattern: "fill_pattern",
-  // ventilador
-  fan_speed: "min_fan_speed",
-  fan_min_speed: "min_fan_speed",
-  fan_max_speed: "max_fan_speed",
-  // temperaturas
-  nozzle_temperature: "temperature",
-  // retracción
-  lift_z: "retract_lift",
-};
-
-const PERCENT_KEYS = new Set([
-  "fill_density",
-  "min_fan_speed",
-  "max_fan_speed",
-  "bridge_fan_speed",
-]);
-
-function normalizeParams(raw = {}) {
-  const out = {};
-  // mapear sinónimos
-  for (const [k, v] of Object.entries(raw)) out[KEY_MAP[k] || k] = v;
-  // fan_speed => min/max si faltan
-  if (raw.fan_speed != null) {
-    if (out.min_fan_speed == null) out.min_fan_speed = raw.fan_speed;
-    if (out.max_fan_speed == null) out.max_fan_speed = raw.fan_speed;
-  }
-  // tipado y % explícito
-  for (const k of Object.keys(out)) {
-    let val = out[k];
-    if (
-      typeof val === "string" &&
-      val.trim() !== "" &&
-      !val.trim().endsWith("%") &&
-      !isNaN(Number(val))
-    ) {
-      val = Number(val);
-    }
-    if (PERCENT_KEYS.has(k) && typeof val === "number") val = `${val}%`;
-    out[k] = val;
-  }
-  return out;
-}
-
-function sanitizeBedShape(val) {
-  if (!val) return null;
-  val = String(val).replace(/\s+/g, "");
-  const ok =
-    /^-?\d+(\.\d+)?x-?\d+(\.\d+)?(,-?\d+(\.\d+)?x-?\d+(\.\d+)?){3,}$/i.test(
-      val
-    );
-  return ok ? val : null;
-}
-
-function defaultBedShapeFor(threadId) {
-  if (profiles.has(threadId)) {
-    const dat = profiles.get(threadId).data;
-    const raw = dat?.printer?.bed_shape || dat?.bed_shape;
-    const s = sanitizeBedShape(raw);
-    if (s) return s;
-  }
-  // default: MK3S 250x210
-  return "0x0,250x0,250x210,0x210";
-}
-
-function buildIniFromParams(params = {}, ctx = {}) {
-  const p = normalizeParams(params);
-
-  // asegurar bed_shape válido
-  let bedShape = sanitizeBedShape(p.bed_shape);
-  if (!bedShape) bedShape = defaultBedShapeFor(ctx.threadId);
-  p.bed_shape = bedShape;
-
-  const filtered = {};
-  for (const k of PARAM_KEYS) {
-    const v = p[k];
-    if (v !== undefined && v !== null && v !== "") filtered[k] = v;
-  }
-
-  const GROUPS = [
-    [
-      "; ---- Capas/Geometría",
-      [
-        "layer_height",
-        "first_layer_height",
-        "perimeters",
-        "top_solid_layers",
-        "bottom_solid_layers",
-        "nozzle_diameter",
-      ],
-    ],
-    [
-      "; ---- Infill",
-      ["fill_density", "fill_pattern", "fill_angle"],
-    ],
-    [
-      "; ---- Velocidades",
-      [
-        "perimeter_speed",
-        "infill_speed",
-        "solid_infill_speed",
-        "top_solid_infill_speed",
-        "gap_fill_speed",
-        "first_layer_speed",
-        "bridge_speed",
-        "travel_speed",
-      ],
-    ],
-    [
-      "; ---- Temperaturas",
-      [
-        "temperature",
-        "first_layer_temperature",
-        "bed_temperature",
-        "first_layer_bed_temperature",
-      ],
-    ],
-    [
-      "; ---- Ventilador",
-      ["min_fan_speed", "max_fan_speed", "bridge_fan_speed"],
-    ],
-    [
-      "; ---- Retracción/Mov.",
-      [
-        "retract_length",
-        "retract_speed",
-        "deretract_speed",
-        "retract_restart_extra",
-        "retract_lift",
-      ],
-    ],
-    [
-      "; ---- Adhesión",
-      ["brim_type", "brim_width", "skirt_distance", "skirts"],
-    ],
-    [
-      "; ---- Filamento/Impresora",
-      [
-        "filament_diameter",
-        "extrusion_multiplier",
-        "max_print_height",
-        "bed_shape",
-      ],
-    ],
-  ];
-
-  let out = `; ============================\n; Perfil generado por Oppi\n; ============================\n\n`;
-  const printed = new Set();
-
-  for (const [title, keys] of GROUPS) {
-    const lines = [];
-    for (const k of keys) {
-      if (filtered[k] !== undefined) {
-        lines.push(`${k} = ${filtered[k]}`);
-        printed.add(k);
-      }
-    }
-    if (lines.length) out += `${title}\n${lines.join("\n")}\n\n`;
-  }
-
-  const rest = Object.keys(filtered).filter((k) => !printed.has(k));
-  if (rest.length)
-    out +=
-      `; ---- Otros\n` +
-      rest.map((k) => `${k} = ${filtered[k]}`).join("\n") +
-      "\n";
-
-  return out.trim() + "\n";
-}
-
-// ------------------------------
-// Biblioteca STL
-// ------------------------------
-let STL_CACHE = null;
-async function loadStlLibrary() {
-  if (STL_CACHE) return STL_CACHE;
-  try {
-    const raw = await fs.readFile(
-      path.join(process.cwd(), "data", "stl-library.json"),
-      "utf8"
-    );
-    STL_CACHE = JSON.parse(raw);
-  } catch (e) {
-    console.error("❌ Error cargando stl-library.json:", e);
-    STL_CACHE = [];
-  }
-  return STL_CACHE;
-}
-
-function stlScore(model, query) {
-  const full =
-    (model.nombre || "") +
-    " " +
-    (model.descripcion || "") +
-    " " +
-    (model.categoria || "") +
-    " " +
-    (Array.isArray(model.tags) ? model.tags : []).join(" ");
-
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  let score = 0;
-  for (const w of words) if (full.toLowerCase().includes(w)) score++;
-  return score;
-}
-
-async function bestStl(prompt) {
-  const lib = await loadStlLibrary();
-  const matches = lib
-    .map((m) => ({ ...m, score: stlScore(m, prompt) }))
-    .filter((m) => m.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  return matches[0] || null;
-}
-
-function describeStlLibraryForAi(lib) {
-  return lib
-    .map((m, i) => {
-      const tags = Array.isArray(m.tags) ? m.tags.join(", ") : "";
-      return `#${i + 1}
-archivo: ${m.archivo}
-nombre: ${m.nombre}
-descripcion: ${m.descripcion}
-categoria: ${m.categoria}
-dificultad: ${m.dificultad}
-tags: ${tags}`;
-    })
-    .join("\n\n");
-}
-
-// ------------------------------
-// Supabase: helpers de conversación/mensajes
-// ------------------------------
-async function getOrCreateConversation({ userId, threadId, title }) {
-  const { data, error } = await supabaseAdmin
-    .from("conversations")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("thread_id", threadId)
-    .limit(1);
-
-  if (error) {
-    console.error("❌ Error buscando conversation:", error);
-    throw new Error("No pude buscar la conversación");
-  }
-
-  if (data && data.length) return data[0];
-
-  const { data: inserted, error: insErr } = await supabaseAdmin
-    .from("conversations")
-    .insert({
-      user_id: userId,
-      thread_id: threadId,
-      title: title || "Conversación Oppi",
-    })
-    .select()
-    .single();
-
-  if (insErr) {
-    console.error("❌ Error creando conversation:", insErr);
-    throw new Error("No pude crear la conversación");
-  }
-
-  return inserted;
-}
-
-async function insertMessage({ conversationId, role, content }) {
-  const { error } = await supabaseAdmin.from("messages").insert({
-    conversation_id: conversationId,
-    role,
-    content,
-  });
-
-  if (error) {
-    console.error("❌ Error insertando mensaje:", error);
-  }
-}
-
-// Actualiza summary con los últimos 3 mensajes de esa conversación
-async function updateConversationSummary(conversationId) {
-  const { data: msgs, error } = await supabaseAdmin
-    .from("messages")
-    .select("role, content, created_at")
-    .eq("conversation_id", conversationId)
-    .order("created_at", { ascending: true })
-    .limit(20);
-
-  if (error) {
-    console.error("❌ Error trayendo mensajes para summary:", error);
-    return;
-  }
-  if (!msgs || !msgs.length) return;
-
-  const lastMsgs = msgs.slice(-3);
-  const lines = lastMsgs.map((m) => {
-    const speaker = m.role === "user" ? "Usuario" : "Oppi";
-    return `${speaker}: ${m.content}`;
-  });
-
-  let summaryText = lines.join("\n");
-  if (summaryText.length > 900) {
-    summaryText = summaryText.slice(0, 900) + "...";
-  }
-
-  const { error: upErr } = await supabaseAdmin
-    .from("conversations")
-    .update({
-      summary: summaryText,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", conversationId);
-
-  if (upErr) {
-    console.error("❌ Error actualizando summary:", upErr);
-  }
-}
-
-// ------------------------------
-// Rutas
-// ------------------------------
-
-// CHAT — ahora ligado a Supabase por cuenta + resumen por conversación
-// CHAT
-// CHAT
-app.post("/chat-oppi", requireSupabaseUser, async (req, res) => {
-  try {
-    const { message, threadId } = req.body || {};
-    if (!message || !threadId) {
-      return res.status(400).json({ error: "Falta message o threadId." });
-    }
-
-    const userId = req.supabaseUser.id; // viene del middleware
-
-    const history = getThread(threadId);
-
-    let profileContext = "";
-    if (profiles.has(threadId)) {
-      profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
-    }
-
-    const contents = [
-      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-      ...history.map((t) => ({
-        role: t.role === "model" ? "model" : "user",
-        parts: [{ text: t.text }],
-      })),
-      { role: "user", parts: [{ text: message }] },
-    ];
-
-    const text = await askGemini("gemini-2.5-flash", contents);
-
-    // Guardar en memoria en RAM
-    pushTurn(threadId, "user", message);
-    pushTurn(threadId, "model", text || "(sin respuesta)");
-
-    // 🔹 Guardar snapshot en Supabase (async, sin bloquear la respuesta al usuario)
-    saveThreadSnapshot({ userId, threadId }).catch((e) =>
-      console.error("❌ Error en saveThreadSnapshot:", e)
-    );
-
-    if (!text) {
-      console.warn("⚠️ Gemini no devolvió texto en /chat-oppi");
-      return res.json({
-        reply:
-          "Por ahora no pude generar una respuesta. Probá reformular la consulta o intentá de nuevo en unos segundos.",
-      });
-    }
-
-    res.json({ reply: text });
-  } catch (err) {
-    console.error("❌ Chat error:", err?.message, err);
-    res.status(500).json({ error: "Error al generar respuesta." });
-  }
-});
-
-
-
-// RESET hilo — limpia RAM y mensajes/summary en DB de ese thread
-app.post("/reset-thread", requireSupabaseUser, async (req, res) => {
-  try {
-    const userId = req.supabaseUser.id;
-    const { threadId } = req.body || {};
-    if (!threadId) {
-      return res.status(400).json({ error: "Falta threadId." });
-    }
-
-    // Limpiamos memoria en RAM
-    memory.delete(threadId);
-    profiles.delete(threadId);
-
-    // Buscamos la conversación en DB
-    const { data, error } = await supabaseAdmin
-      .from("conversations")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("thread_id", threadId)
-      .limit(1);
-
-    if (!error && data && data.length) {
-      const convId = data[0].id;
-
-      // Borramos mensajes y reseteamos summary
-      await supabaseAdmin
-        .from("messages")
-        .delete()
-        .eq("conversation_id", convId);
-
-      await supabaseAdmin
-        .from("conversations")
-        .update({
-          summary: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", convId);
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("❌ reset-thread error:", err);
-    res.status(500).json({ error: "No se pudo resetear el hilo." });
-  }
-});
-
-function buildSimpleSummary(history) {
-  if (!history || !history.length) return null;
-
-  // Nos quedamos con los mensajes del usuario
-  const userMsgs = history
-    .filter(m => m.role === "user")
-    .map(m => m.text);
-
-  if (!userMsgs.length) return null;
-
-  // Tomamos los últimos 3 textos del usuario y los recortamos
-  const joined = userMsgs.slice(-3).join(" | ");
-  return joined.length > 280 ? joined.slice(0, 277) + "..." : joined;
-}
-
-async function saveThreadSnapshot({ userId, threadId }) {
-  try {
-    const history = memory.get(threadId) || [];
-    const summary = buildSimpleSummary(history);
-
-    // Últimos 3 mensajes (user/model) para mostrar rápido
-    const lastMessages = history.slice(-3);
-
-    // Buscamos el nombre del hilo desde el frontend (si no, uno genérico)
-    const name = `Conversación Oppi`;
-
-    const { error } = await supabaseAdmin
-      .from("oppi_threads")
-      .upsert(
-        {
-          id: threadId,
-          user_id: userId,
-          name,
-          summary,
-          last_messages: lastMessages,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "id" } // si existe, actualiza
+    renderThreads();
+    clearChatUI();
+    if (threadId) {
+      renderHistoryForThread(threadId);
+      push(
+        "oppi",
+        `Estás en: ${threads[threadId].name || "Nuevo chat"}. Podés seguir hablando o empezar un tema nuevo.`
       );
-
-    if (error) {
-      console.error("❌ Error guardando oppi_threads:", error);
     }
   } catch (err) {
-    console.error("❌ saveThreadSnapshot error:", err);
+    console.warn("No pude sincronizar hilos desde backend (continuo con local):", err);
+    renderThreads();
   }
 }
 
+async function initAuthState() {
+  const { data, error } = await supabase.auth.getSession();
+  if (!error && data.session?.user) {
+    currentUser = data.session.user;
+  } else {
+    currentUser = null;
+  }
+  updateAuthUI();
+  if (currentUser) {
+    await syncThreadsFromBackend();
+  } else {
+    renderThreads();
+  }
+}
 
-// IMPORTAR .ini
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 },
+supabase.auth.onAuthStateChange(async (_event, session) => {
+  currentUser = session?.user ?? null;
+  updateAuthUI();
+
+  if (currentUser) {
+    // Limpiamos estados locales por si venía otro usuario
+    threads = {};
+    historyByThread = {};
+    localStorage.removeItem(THREADS_KEY);
+    localStorage.removeItem(HISTORY_KEY);
+    localStorage.removeItem(CURRENT_KEY);
+    threadId = null;
+    ensureFirstThread();
+    await syncThreadsFromBackend();
+  } else {
+    // Al desloguearse, limpiamos todo
+    threads = {};
+    historyByThread = {};
+    localStorage.removeItem(THREADS_KEY);
+    localStorage.removeItem(HISTORY_KEY);
+    localStorage.removeItem(CURRENT_KEY);
+    threadId = null;
+    ensureFirstThread();
+    clearChatUI();
+    renderThreads();
+  }
 });
 
-app.post(
-  "/import-ini",
-  requireSupabaseUser,
-  upload.single("file"),
-  async (req, res) => {
+// Cerrar sesión
+authLogoutBtn?.addEventListener("click", async () => {
+  try {
+    await supabase.auth.signOut();
+    push("oppi", "Cerraste sesión. Podés volver a iniciar cuando quieras.");
+  } catch (err) {
+    console.error("Error al cerrar sesión:", err);
+    push("oppi", "No pude cerrar sesión, probá de nuevo.");
+  }
+});
+
+// Helper login obligatorio
+function ensureLoggedIn() {
+  if (!currentUser) {
+    push(
+      "oppi",
+      "Para usar todas las funciones de Oppi tenés que iniciar sesión."
+    );
+    openAuthModal();
+    return false;
+  }
+  return true;
+}
+
+// Registro
+if (registerBtn) {
+  registerBtn.addEventListener("click", async () => {
+    registerStatus.textContent = "Creando cuenta...";
+
+    const email = registerEmail.value.trim();
+    const password = registerPassword.value.trim();
+
+    if (!email || !password) {
+      registerStatus.textContent = "Completá email y contraseña.";
+      return;
+    }
+
+    const { data, error } = await supabase.auth.signUp({ email, password });
+    if (error) {
+      registerStatus.textContent = "Error: " + error.message;
+    } else {
+      registerStatus.textContent =
+        "Cuenta creada. Revisá tu mail si pide confirmación.";
+      console.log("SignUp:", data);
+    }
+  });
+}
+
+// Login
+if (loginBtn) {
+  loginBtn.addEventListener("click", async () => {
+    loginStatus.textContent = "Iniciando sesión...";
+
+    const email = loginEmail.value.trim();
+    const password = loginPassword.value.trim();
+
+    if (!email || !password) {
+      loginStatus.textContent = "Completá email y contraseña.";
+      return;
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      loginStatus.textContent = "Error: " + error.message;
+    } else {
+      loginStatus.textContent = "Sesión iniciada.";
+      console.log("SignIn:", data);
+      closeAuthModal();
+    }
+  });
+}
+
+// Debug /api/me
+if (btnVerCuenta) {
+  btnVerCuenta.addEventListener("click", async () => {
+    meOutput.textContent = "Consultando /api/me...";
+
     try {
-      const { threadId } = req.body || {};
-      if (!threadId)
-        return res.status(400).json({ error: "Falta threadId." });
-      if (!req.file)
-        return res.status(400).json({ error: "Subí un archivo .ini." });
-
-      const raw = req.file.buffer.toString("utf8");
-      const data = ini.parse(raw);
-      const summary = summarizeProfile(data);
-
-      profiles.set(threadId, { raw, data, summary });
-      pushTurn(
-        threadId,
-        "user",
-        `Nota de sistema: Se importó un perfil .ini para este hilo.\n${summary}`
-      );
-      res.json({ ok: true, summary });
+      const data = await callBackend("/api/me");
+      meOutput.textContent = JSON.stringify(data, null, 2);
     } catch (err) {
-      console.error("❌ import-ini error:", err);
-      res.status(500).json({ error: "No se pudo importar el .ini." });
+      meOutput.textContent = "Error: " + err.message;
+      console.error(err);
     }
-  }
-);
-
-// GENERAR .ini con IA
-app.post("/generate-ini-ai", requireSupabaseUser, async (req, res) => {
-  try {
-    const { threadId, overrides } = req.body || {};
-    if (!threadId) return res.status(400).json({ error: "Falta threadId." });
-
-    const history = getThread(threadId);
-    let profileContext = "";
-    if (profiles.has(threadId))
-      profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
-
-    const schemaList = PARAM_KEYS.map((k) => `"${k}"`).join(", ");
-    const askJson = `
-Quiero que construyas un JSON de parámetros para PrusaSlicer (modo principiante estable).
-Usá SOLO estas claves exactamente (puede faltar alguna si no aplica): [${schemaList}].
-Valores numéricos donde corresponda (mm, mm/s, °C, %, etc.). Si falta info, elegí valores seguros tipo "Modo Abuela".
-IMPORTANTE: respondé SOLO con JSON plano válido (sin markdown, sin comentarios, sin texto extra).
-`;
-
-    const contents = [
-      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
-      ...history.map((t) => ({
-        role: t.role === "model" ? "model" : "user",
-        parts: [{ text: t.text }],
-      })),
-      { role: "user", parts: [{ text: askJson }] },
-    ];
-
-    const raw = await askGemini("gemini-2.5-flash", contents);
-    if (!raw) {
-      console.error("❌ generate-ini-ai: IA no devolvió texto");
-      return res.status(502).json({ error: "La IA no devolvió contenido." });
-    }
-
-    const json = extractJsonFromText(raw);
-    if (!json) {
-      console.error("❌ Respuesta cruda de la IA (sin JSON válido):\n", raw);
-      return res.status(502).json({ error: "La IA no devolvió JSON válido." });
-    }
-
-    const params = { ...json, ...(overrides || {}) };
-    const iniText = buildIniFromParams(params, { threadId });
-
-    res.json({ ok: true, params: normalizeParams(params), iniText });
-  } catch (err) {
-    console.error("❌ generate-ini-ai error:", err);
-    res.status(500).json({ error: "No pude generar el .ini con IA." });
-  }
-});
-
-// SUGERIR STL (simple, por texto)
-app.post("/api/stl/suggest", async (req, res) => {
-  try {
-    const { prompt } = req.body || {};
-    if (!prompt || !prompt.trim()) return res.json({ found: false });
-
-    const model = await bestStl(prompt);
-    if (!model) return res.json({ found: false });
-
-    res.json({ found: true, model });
-  } catch (err) {
-    console.error("❌ STL error:", err);
-    res.status(500).json({ error: "No pude buscar STL." });
-  }
-});
-
-// SUGERIR STL usando IA + historial de conversación
-app.post("/api/stl/suggest-ai", requireSupabaseUser, async (req, res) => {
-  try {
-    const { threadId } = req.body || {};
-    if (!threadId) {
-      return res.status(400).json({ ok: false, error: "Falta threadId." });
-    }
-
-    const history = getThread(threadId);
-    const lib = await loadStlLibrary();
-    if (!lib.length) {
-      return res.json({ ok: false, error: "Biblioteca STL vacía." });
-    }
-
-    const libDesc = describeStlLibraryForAi(lib);
-
-    const ask = `
-Tenés esta conversación previa con el usuario sobre impresión 3D y esta biblioteca de modelos STL.
-Elegí EL MEJOR modelo STL de la lista para que imprima ahora.
-
-Devolvé EXCLUSIVAMENTE un JSON válido con esta forma:
-
-{
-  "archivo": "nombre_del_archivo.stl",
-  "nombre": "Nombre legible del modelo",
-  "motivo": "Texto corto explicando por qué lo elegiste"
+  });
 }
 
-Usá SIEMPRE un valor de "archivo" que esté EXACTAMENTE en el campo "archivo" de alguno de los modelos listados.
+// Ocultar tarjeta "Abrir en Prusa" si backend remoto
+if (typeof API_BASE === "string" && API_BASE) {
+  document
+    .querySelectorAll("#open-ini-prusa-file, #open-ini-prusa-btn")
+    .forEach((el) => el?.closest(".card")?.remove());
+}
 
-Biblioteca de modelos:
+// ────────────────────────────────────────────────────────────────
+// Threads en localStorage + historial corto
 
-${libDesc}
-`;
+const THREADS_KEY = "oppi.threads";
+const CURRENT_KEY = "oppi.currentThread";
+const HISTORY_KEY = "oppi.threadHistory";
 
-    const contents = [
-      { role: "user", parts: [{ text: SYSTEM }] },
-      ...history.map((t) => ({
-        role: t.role === "model" ? "model" : "user",
-        parts: [{ text: t.text }],
-      })),
-      { role: "user", parts: [{ text: ask }] },
-    ];
-
-    const raw = await askGemini("gemini-2.0-flash", contents);
-    if (!raw) {
-      console.error("❌ STL AI: IA no devolvió texto");
-      return res
-        .status(502)
-        .json({ ok: false, error: "La IA no devolvió contenido." });
-    }
-
-    const json = extractJsonFromText(raw);
-    if (!json || !json.archivo) {
-      console.error("❌ STL AI sin JSON válido. Respuesta cruda:\n", raw);
-
-      // Fallback: simplemente usar el primer modelo de la biblioteca
-      const fallback = lib[0];
-      return res.json({
-        ok: true,
-        model: fallback,
-        motivo:
-          "Usé un modelo de la biblioteca por defecto porque la IA no respondió con un JSON válido.",
+function uuid() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === "x" ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
       });
-    }
+}
 
-    // Buscar en la biblioteca el archivo elegido
-    const model =
-      lib.find((m) => m.archivo === json.archivo) ||
-      (await bestStl(json.nombre || json.motivo || json.archivo)) ||
-      lib[0];
-
-    return res.json({
-      ok: true,
-      model,
-      motivo: json.motivo || null,
-    });
-  } catch (err) {
-    console.error("❌ STL AI error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "No pude elegir un STL con IA." });
-  }
-});
-
-// (Opcional) ABRIR en PrusaSlicer local
-app.post("/open-prusa", async (req, res) => {
+function loadThreads() {
   try {
-    const { iniText, iniPath } = req.body || {};
-    const prusaPath = process.env.PRUSASLICER_PATH;
-    if (!prusaPath)
-      return res
-        .status(400)
-        .json({ error: "Falta PRUSASLICER_PATH en .env" });
+    return JSON.parse(localStorage.getItem(THREADS_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+function saveThreads(o) {
+  localStorage.setItem(THREADS_KEY, JSON.stringify(o));
+}
 
-    let fileToLoad = iniPath;
-    if (!fileToLoad) {
-      if (!iniText)
-        return res
-          .status(400)
-          .json({ error: "Falta iniText o iniPath." });
-      fileToLoad = await writeTmpIni(iniText);
-    }
+function loadHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+function saveHistory(h) {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+}
 
-    const child = spawn(prusaPath, ["--load", fileToLoad], {
-      detached: true,
-      stdio: "ignore",
+let threads = loadThreads();
+let threadId = localStorage.getItem(CURRENT_KEY);
+let historyByThread = loadHistory();
+
+function ensureFirstThread() {
+  if (!threadId) {
+    const id = uuid();
+    threads[id] = { name: "Conversación 1", created: Date.now() };
+    saveThreads(threads);
+    localStorage.setItem(CURRENT_KEY, id);
+    threadId = id;
+  }
+}
+ensureFirstThread();
+
+// Historial corto (3 mensajes)
+function recordMessage(role, text) {
+  if (!threadId || !text) return;
+  if (!historyByThread[threadId]) historyByThread[threadId] = [];
+
+  const arr = historyByThread[threadId];
+  arr.push({ role, text, ts: Date.now() });
+  historyByThread[threadId] = arr.slice(-3);
+  saveHistory(historyByThread);
+}
+
+function clearChatUI() {
+  if (box) box.innerHTML = "";
+}
+
+function renderHistoryForThread(id) {
+  if (!box) return;
+  const arr = historyByThread[id] || [];
+  for (const msg of arr) {
+    push(msg.role === "user" ? "user" : "oppi", msg.text, { allowHtml: false });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Menú de tres puntitos (renombrar / borrar)
+
+let menuThreadId = null;
+let threadMenu = null;
+
+function ensureThreadMenu() {
+  if (threadMenu) return threadMenu;
+
+  const menu = document.createElement("div");
+  menu.id = "thread-context-menu";
+  menu.className = "thread-context-menu";
+  menu.style.position = "fixed";
+  menu.style.minWidth = "170px";
+  menu.style.background = "rgba(10,10,20,0.98)";
+  menu.style.border = "1px solid rgba(255,255,255,0.06)";
+  menu.style.borderRadius = "10px";
+  menu.style.padding = "4px 0";
+  menu.style.display = "none";
+  menu.style.zIndex = "9999";
+  menu.style.backdropFilter = "blur(8px)";
+
+  const addItem = (label, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.style.display = "block";
+    b.style.width = "100%";
+    b.style.textAlign = "left";
+    b.style.padding = "8px 14px";
+    b.style.background = "transparent";
+    b.style.border = "none";
+    b.style.cursor = "pointer";
+    b.style.fontSize = "0.9rem";
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onClick();
     });
-    child.unref();
-    res.json({ ok: true, loaded: fileToLoad });
+    menu.appendChild(b);
+  };
+
+  addItem("Renombrar", () => {
+    const id = menuThreadId;
+    hideThreadMenu();
+    if (id) renameThread(id);
+  });
+
+  addItem("Eliminar", () => {
+    const id = menuThreadId;
+    hideThreadMenu();
+    if (id) deleteThread(id);
+  });
+
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  document.body.appendChild(menu);
+  threadMenu = menu;
+  return menu;
+}
+
+function showThreadMenu(threadIdParam, anchorEl) {
+  const menu = ensureThreadMenu();
+  menuThreadId = threadIdParam;
+
+  const rect = anchorEl.getBoundingClientRect();
+  const menuWidth = 190;
+
+  menu.style.top = rect.bottom + 4 + "px";
+  menu.style.left = rect.right - menuWidth + "px";
+  menu.style.display = "block";
+}
+
+function hideThreadMenu() {
+  if (!threadMenu) return;
+  threadMenu.style.display = "none";
+  menuThreadId = null;
+}
+
+document.addEventListener("click", () => hideThreadMenu());
+
+// ────────────────────────────────────────────────────────────────
+// Sidebar de conversaciones
+
+function renderThreads() {
+  if (!threadList) return;
+  threadList.innerHTML = "";
+
+  const entries = Object.entries(threads).sort(
+    (a, b) => a[1].created - b[1].created
+  );
+  if (!entries.length) return;
+
+  for (const [id, t] of entries) {
+    const row = document.createElement("div");
+    row.className = "thread-row" + (id === threadId ? " active" : "");
+    row.style.display = "flex";
+    row.style.alignItems = "center";
+    row.style.justifyContent = "space-between";
+    row.style.gap = "4px";
+
+    const btn = document.createElement("button");
+    btn.className = "thread-item";
+    btn.textContent = t.name || "Chat sin título";
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      switchThread(id);
+    });
+
+    const menuBtn = document.createElement("button");
+    menuBtn.type = "button";
+    menuBtn.className = "thread-menu-trigger";
+    menuBtn.textContent = "⋮";
+    menuBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const open = menuThreadId === id && threadMenu?.style.display === "block";
+      if (open) {
+        hideThreadMenu();
+      } else {
+        showThreadMenu(id, menuBtn);
+      }
+    });
+
+    row.appendChild(btn);
+    row.appendChild(menuBtn);
+    threadList.appendChild(row);
+  }
+
+  // Aseguramos scroll vertical
+  const scrollHost = threadList.parentElement || threadList;
+  scrollHost.style.overflowY = "auto";
+  scrollHost.style.maxHeight = "calc(100vh - 160px)";
+}
+
+function switchThread(id) {
+  if (!threads[id]) return;
+  if (id === threadId) return;
+
+  threadId = id;
+  localStorage.setItem(CURRENT_KEY, id);
+
+  clearChatUI();
+  renderHistoryForThread(id);
+  push(
+    "oppi",
+    `Estás en: ${threads[id].name || "Nuevo chat"}. Podés seguir hablando o empezar un tema nuevo.`
+  );
+
+  renderThreads();
+}
+
+async function createNewThread() {
+  if (!ensureLoggedIn()) return;
+
+  const id = uuid();
+  const count = Object.keys(threads).length + 1;
+
+  threads[id] = { name: `Conversación ${count}`, created: Date.now() };
+  saveThreads(threads);
+
+  threadId = id;
+  localStorage.setItem(CURRENT_KEY, id);
+
+  clearChatUI();
+  push("oppi", "Nuevo chat creado. Contame qué querés imprimir.");
+
+  renderThreads();
+
+  // Avisar al backend (si tenés endpoint de resumen, lo podés usar acá)
+  try {
+    await callBackend("/api/threads/rename", {
+      method: "POST",
+      body: JSON.stringify({ threadId: id, name: threads[id].name }),
+    });
   } catch (err) {
-    console.error("❌ open-prusa error:", err);
-    res
-      .status(500)
-      .json({ error: "No pude abrir PrusaSlicer con ese .ini." });
+    console.warn("No se pudo registrar el nuevo hilo en backend (no crítico):", err);
+  }
+}
+
+async function renameThread(id) {
+  if (!threads[id]) return;
+  if (!ensureLoggedIn()) return;
+
+  const currentName = threads[id].name || "Chat sin título";
+  const newName = prompt("Nuevo nombre para la conversación:", currentName);
+  if (!newName) return;
+
+  threads[id].name = newName;
+  saveThreads(threads);
+  renderThreads();
+
+  try {
+    await callBackend("/api/threads/rename", {
+      method: "POST",
+      body: JSON.stringify({ threadId: id, name: newName }),
+    });
+  } catch (err) {
+    console.error("Error renombrando hilo en backend:", err);
+  }
+}
+
+async function deleteThread(id) {
+  if (!threads[id]) return;
+  if (!ensureLoggedIn()) return;
+
+  const confirmed = confirm(
+    "¿Seguro que querés borrar esta conversación? También se eliminará de la base de datos si existe."
+  );
+  if (!confirmed) return;
+
+  try {
+    await callBackend("/api/threads/delete", {
+      method: "POST",
+      body: JSON.stringify({ threadId: id }),
+    });
+  } catch (err) {
+    console.error("Error borrando hilo en backend:", err);
+  }
+
+  delete threads[id];
+  saveThreads(threads);
+  delete historyByThread[id];
+  saveHistory(historyByThread);
+
+  if (id === threadId) {
+    const remaining = Object.keys(threads);
+    if (remaining.length > 0) {
+      threadId = remaining[0];
+      localStorage.setItem(CURRENT_KEY, threadId);
+      clearChatUI();
+      renderHistoryForThread(threadId);
+      push(
+        "oppi",
+        `Estás en: ${
+          threads[threadId].name || "Nuevo chat"
+        }. Podés seguir hablando o empezar un tema nuevo.`
+      );
+    } else {
+      threadId = null;
+      ensureFirstThread();
+      clearChatUI();
+      renderHistoryForThread(threadId);
+      push("oppi", "Nuevo chat creado. Contame qué querés imprimir.");
+    }
+  }
+
+  renderThreads();
+}
+
+newThreadBtn?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  createNewThread();
+});
+
+// ────────────────────────────────────────────────────────────────
+// Render chat y utilidades
+
+function push(who, text, { allowHtml = false } = {}) {
+  const msg = document.createElement("div");
+  msg.className = `msg ${who}`;
+  msg[allowHtml ? "innerHTML" : "textContent"] = text;
+  box.appendChild(msg);
+  box.scrollTop = box.scrollHeight;
+  return msg;
+}
+
+function setTyping(on = true) {
+  const id = "__typing__";
+  let el = document.getElementById(id);
+  if (on) {
+    if (el) return;
+    el = document.createElement("div");
+    el.id = id;
+    el.className = "msg oppi";
+    el.textContent = "Oppi está escribiendo…";
+    box.appendChild(el);
+  } else if (el) el.remove();
+  box.scrollTop = box.scrollHeight;
+}
+
+function toSimpleHtml(md) {
+  const esc = (s) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let html = esc(md || "");
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/`([^`]+?)`/g, "<code>$1</code>");
+  html = html.replace(/\n/g, "<br>");
+  return html;
+}
+
+function extractIniBlock(text) {
+  const re = /```(?:ini)?\s*([\s\S]*?)```/i;
+  const m = (text || "").match(re);
+  return m ? m[1].trim() : null;
+}
+
+function attachIniActions(msgEl, iniText, filename = "perfil-oppi.prusa.ini") {
+  const bar = document.createElement("div");
+  bar.style.marginTop = "8px";
+  bar.style.display = "flex";
+  bar.style.flexWrap = "wrap";
+  bar.style.gap = "8px";
+
+  const pre = document.createElement("pre");
+  pre.style.whiteSpace = "pre-wrap";
+  pre.style.margin = "8px 0";
+  pre.textContent = iniText;
+
+  const btnDl = document.createElement("button");
+  btnDl.textContent = "Descargar .ini";
+  btnDl.className = "btn";
+  btnDl.addEventListener("click", () => {
+    const blob = new Blob([iniText], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  bar.appendChild(btnDl);
+  msgEl.appendChild(bar);
+  msgEl.appendChild(pre);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ────────────────────────────────────────────────────────────────
+// Eventos principales
+
+form?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!ensureLoggedIn()) return;
+
+  const text = input.value.trim();
+  if (!text) return;
+
+  push("user", text);
+  recordMessage("user", text);
+  input.value = "";
+  setTyping(true);
+
+  try {
+    const threadName = threads[threadId]?.name || null;
+    const data = await callBackend("/chat-oppi", {
+      method: "POST",
+      body: JSON.stringify({ message: text, threadId, threadName }),
+    });
+
+    setTyping(false);
+
+    const reply = data.reply || "Hubo un problema al responder.";
+    recordMessage("oppi", reply);
+
+    const msgEl = push("oppi", toSimpleHtml(reply), { allowHtml: true });
+    const ini = extractIniBlock(reply);
+    if (ini) attachIniActions(msgEl, ini);
+  } catch (err) {
+    console.error("Error en chat-oppi:", err);
+    setTyping(false);
+    push("oppi", `No pude responder: ${err.message}`);
   }
 });
 
-// Info de la cuenta (debug)
-app.get("/api/me", requireSupabaseUser, (req, res) => {
-  res.json({
-    id: req.supabaseUser.id,
-    email: req.supabaseUser.email,
-  });
+resetBtn?.addEventListener("click", async () => {
+  if (!ensureLoggedIn()) return;
+
+  try {
+    await callBackend("/reset-thread", {
+      method: "POST",
+      body: JSON.stringify({ threadId }),
+    });
+    push("oppi", "Memoria reiniciada.");
+    historyByThread[threadId] = [];
+    saveHistory(historyByThread);
+  } catch (err) {
+    console.error("Error al reiniciar memoria:", err);
+    push("oppi", `Error al reiniciar memoria: ${err.message}`);
+  }
 });
 
-// ------------------------------
-// Iniciar servidor
-// ------------------------------
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`🧠 Oppi con memoria + Supabase en puerto ${PORT}`);
+importBtn?.addEventListener("click", () => {
+  if (!ensureLoggedIn()) return;
+  iniFile?.click();
 });
 
-server.on("error", (err) => {
-  console.error("❌ No se pudo iniciar el servidor:", err);
-  process.exit(1);
+iniFile?.addEventListener("change", async () => {
+  const file = iniFile.files?.[0];
+  if (!file) return;
+
+  const msgUser = `Importando perfil: ${file.name} ...`;
+  push("user", msgUser);
+  recordMessage("user", msgUser);
+
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("threadId", threadId);
+
+  try {
+    const data = await callBackend("/import-ini", {
+      method: "POST",
+      body: fd,
+    });
+
+    if (data.ok) {
+      const msg = `Perfil importado.\n${data.summary || ""}`;
+      push("oppi", toSimpleHtml(msg), { allowHtml: true });
+      recordMessage("oppi", msg);
+    } else {
+      const msg = `No pude importar: ${
+        data.error || "Error desconocido al importar"
+      }`;
+      push("oppi", msg);
+      recordMessage("oppi", msg);
+    }
+  } catch (err) {
+    console.error("Error importando .ini:", err);
+    const msg = `Error de red importando el .ini: ${err.message}`;
+    push("oppi", msg);
+    recordMessage("oppi", msg);
+  } finally {
+    iniFile.value = "";
+  }
 });
 
+generateBtn?.addEventListener("click", async () => {
+  if (!ensureLoggedIn()) return;
 
+  const userMsg = "(Generar .ini con Oppi)";
+  push("user", userMsg);
+  recordMessage("user", userMsg);
+  setTyping(true);
 
+  try {
+    const data = await callBackend("/generate-ini-ai", {
+      method: "POST",
+      body: JSON.stringify({ threadId }),
+    });
+
+    setTyping(false);
+
+    if (!data.ok) {
+      const msgError = data?.error || "Error al generar el .ini";
+      const msg = `No pude generar el .ini: ${msgError}`;
+      push("oppi", msg);
+      recordMessage("oppi", msg);
+      return;
+    }
+
+    const msgText = "Perfil generado automáticamente.";
+    const msgEl = push("oppi", msgText);
+    recordMessage("oppi", msgText);
+
+    attachIniActions(msgEl, data.iniText);
+  } catch (err) {
+    console.error("Error generando ini:", err);
+    setTyping(false);
+    const msg = `Error de red generando el .ini: ${err.message}`;
+    push("oppi", msg);
+    recordMessage("oppi", msg);
+  }
+});
+
+suggestStlBtn?.addEventListener("click", async () => {
+  if (!ensureLoggedIn()) return;
+
+  const userMsg = "(Pedir modelo STL a Oppi)";
+  push("user", userMsg);
+  recordMessage("user", userMsg);
+  setTyping(true);
+
+  try {
+    const data = await callBackend("/api/stl/suggest-ai", {
+      method: "POST",
+      body: JSON.stringify({ threadId }),
+    });
+
+    setTyping(false);
+
+    if (!data.ok || !data.model) {
+      const msgText =
+        data?.error ||
+        "Por ahora no pude elegir un modelo STL a partir de lo que hablamos. Probá contarme mejor qué querés imprimir.";
+      push("oppi", msgText);
+      recordMessage("oppi", msgText);
+      return;
+    }
+
+    const m = data.model;
+    const motivo = data.motivo;
+
+    const html = `
+      Te recomiendo este modelo STL basado en lo que estuvimos hablando:<br>
+      <strong>${m.nombre}</strong><br>
+      ${m.descripcion || ""}<br>
+      <em>Categoría:</em> ${m.categoria || "-"} – <em>Dificultad:</em> ${
+      m.dificultad || "-"
+    }<br>
+      ${motivo ? `<em>Motivo:</em> ${motivo}<br>` : ""}
+      <a href="${m.archivo}" target="_blank" rel="noopener noreferrer">Descargar STL</a>
+    `;
+
+    push("oppi", html, { allowHtml: true });
+
+    const resumenPlano = `STL sugerido: ${m.nombre} (${m.categoria || "-"})${
+      motivo ? ". Motivo: " + motivo : ""
+    }`;
+    recordMessage("oppi", resumenPlano);
+  } catch (err) {
+    console.error("Error al sugerir STL:", err);
+    setTyping(false);
+    const msgText = "Tuvimos un problema al buscar el STL. Probá de nuevo.";
+    push("oppi", msgText);
+    recordMessage("oppi", msgText);
+  }
+});
+
+// ────────────────────────────────────────────────────────────────
+// Saludo inicial
+
+window.addEventListener("load", () => {
+  initAuthState();
+
+  if (threadList) {
+    const scrollHost = threadList.parentElement || threadList;
+    scrollHost.style.overflowY = "auto";
+    scrollHost.style.maxHeight = "calc(100vh - 160px)";
+  }
+
+  renderHistoryForThread(threadId);
+
+  push(
+    "oppi",
+    "Hola, soy Oppi. Te acompaño en tu impresión 3D. Podés chatear, importar un .ini, generar uno nuevo automáticamente y pedir un modelo STL para probar.",
+    { allowHtml: true }
+  );
+});
