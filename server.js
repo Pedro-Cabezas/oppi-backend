@@ -42,19 +42,28 @@ const supabaseAdmin = createSupabaseClient(
 // ------------------------------
 // IA: GoogleGenAI
 // ------------------------------
+// ------------------------------
+// IA: GoogleGenAI
+// ------------------------------
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 async function askGemini(modelName, contents) {
-  const result = await ai.models.generateContent({
-    model: modelName,
-    contents,
-  });
+  try {
+    const result = await ai.models.generateContent({
+      model: modelName,
+      contents,
+    });
 
-  // Forma estable: tomamos el primer texto disponible
-  return (
-    result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null
-  );
+    return (
+      result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null
+    );
+  } catch (err) {
+    console.error("❌ Error llamando a Gemini:", err?.message, err);
+    // Devolvemos null para que la ruta maneje el fallback sin tirar 500
+    return null;
+  }
 }
+
 
 // Helper robusto para extraer JSON desde la respuesta de la IA
 function extractJsonFromText(raw) {
@@ -577,80 +586,56 @@ async function updateConversationSummary(conversationId) {
 // ------------------------------
 
 // CHAT — ahora ligado a Supabase por cuenta + resumen por conversación
-app.post("/chat-oppi", requireSupabaseUser, async (req, res) => {
+// CHAT
+app.post("/chat-oppi", async (req, res) => {
   try {
-    const userId = req.supabaseUser.id;
     const { message, threadId } = req.body || {};
     if (!message || !threadId) {
       return res.status(400).json({ error: "Falta message o threadId." });
     }
 
-    // 1) Conversación en Supabase (por usuario + threadId)
-    const conversation = await getOrCreateConversation({
-      userId,
-      threadId,
-      title: "Conversación de impresión 3D",
-    });
+    const history = getThread(threadId);
 
-    // 2) Contexto de perfil .ini (si existe en RAM)
     let profileContext = "";
     if (profiles.has(threadId)) {
       profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
     }
 
-    // 3) Resumen guardado en DB para esta conversación
-    const summaryText =
-      conversation.summary || "Sin resumen previo todavía en esta conversación.";
-
-    const systemText = `${SYSTEM}
-
-[Resumen de esta conversación]
-${summaryText}
-${profileContext}
-`;
-
-    const history = getThread(threadId);
-
     const contents = [
-      { role: "user", parts: [{ text: systemText }] },
+      // Sistema / contexto
+      { role: "user", parts: [{ text: SYSTEM + profileContext }] },
+      // Historial corto
       ...history.map((t) => ({
         role: t.role === "model" ? "model" : "user",
         parts: [{ text: t.text }],
       })),
+      // Mensaje actual del usuario
       { role: "user", parts: [{ text: message }] },
     ];
 
-    const text = await askGemini("gemini-2.0-flash", contents);
-    const finalReply =
-      text || "No pude generar respuesta por el momento. Probá de nuevo.";
+    // Usamos el mismo modelo que en generate-ini (que ya sabés que anda)
+    const text = await askGemini("gemini-2.5-flash", contents);
 
-    // 4) Memoria RAM para contexto corto
+    // Guardar en memoria interna del backend
     pushTurn(threadId, "user", message);
-    pushTurn(threadId, "model", finalReply);
+    pushTurn(threadId, "model", text || "(sin respuesta)");
 
-    // 5) Guardar en Supabase: mensaje de usuario + Oppi
-    await insertMessage({
-      conversationId: conversation.id,
-      role: "user",
-      content: message,
-    });
-    await insertMessage({
-      conversationId: conversation.id,
-      role: "assistant",
-      content: finalReply,
-    });
+    // Si la IA no devolvió nada, devolvemos un fallback amable pero 200 OK
+    if (!text) {
+      console.warn("⚠️ Gemini no devolvió texto en /chat-oppi");
+      return res.json({
+        reply:
+          "Por ahora no pude generar una respuesta. Probá reformular la consulta o intentá de nuevo en unos segundos.",
+      });
+    }
 
-    // 6) Actualizar resumen (no esperamos)
-    updateConversationSummary(conversation.id).catch((e) =>
-      console.error("❌ Error recalculando summary:", e)
-    );
-
-    res.json({ reply: finalReply });
+    res.json({ reply: text });
   } catch (err) {
-    console.error("❌ Chat error:", err);
+    console.error("❌ Chat error:", err?.message, err);
     res.status(500).json({ error: "Error al generar respuesta." });
   }
 });
+
 
 // RESET hilo — limpia RAM y mensajes/summary en DB de ese thread
 app.post("/reset-thread", requireSupabaseUser, async (req, res) => {
@@ -938,3 +923,4 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
+
