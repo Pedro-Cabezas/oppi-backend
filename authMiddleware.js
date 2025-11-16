@@ -1,51 +1,39 @@
 // authMiddleware.js
-import { supabaseAdmin } from "./supabaseAdmin.js";
+// Middleware para validar el usuario de Supabase usando el token JWT que manda el frontend
 
+import dotenv from "dotenv";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+
+dotenv.config();
+
+const supabaseAdmin = createSupabaseClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ✅ ÚNICA definición de requireSupabaseUser
 export async function requireSupabaseUser(req, res, next) {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      return res.status(401).json({ error: "Falta header Authorization" });
-    }
-
+    const authHeader = req.headers.authorization || "";
     const [, token] = authHeader.split(" ");
+
     if (!token) {
-      return res.status(401).json({ error: "Token no encontrado" });
+      return res.status(401).json({ error: "Falta token de Supabase (Authorization: Bearer ...)" });
     }
 
     const { data, error } = await supabaseAdmin.auth.getUser(token);
 
     if (error || !data?.user) {
-      console.error("Error getUser:", error);
-      return res.status(401).json({ error: "Token inválido" });
+      console.error("Error getUser Supabase:", error);
+      return res.status(401).json({ error: "Token de Supabase inválido" });
     }
 
-    // Usuario de Supabase disponible en la request
+    // Guardamos el usuario en la request
     req.supabaseUser = data.user;
-
     next();
-  } catch (e) {
-    console.error("Error en requireSupabaseUser:", e);
-    return res.status(500).json({ error: "Error interno de autenticación" });
+  } catch (err) {
+    console.error("❌ Error en requireSupabaseUser:", err);
+    return res.status(500).json({ error: "Error validando el usuario" });
   }
-}
-
-// Middleware: lee el token Bearer de Supabase y obtiene el usuario
-async function requireSupabaseUser(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const [, token] = authHeader.split(" ");
-
-  if (!token) {
-    return res.status(401).json({ error: "Falta token de Supabase" });
-  }
-
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !data?.user) {
-    console.error("Error getUser Supabase:", error);
-    return res.status(401).json({ error: "Token inválido" });
-  }
-
-  req.supabaseUser = data.user;
-  next();
 }
 
