@@ -42,9 +42,6 @@ const supabaseAdmin = createSupabaseClient(
 // ------------------------------
 // IA: GoogleGenAI
 // ------------------------------
-// ------------------------------
-// IA: GoogleGenAI
-// ------------------------------
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 async function askGemini(modelName, contents) {
@@ -63,7 +60,6 @@ async function askGemini(modelName, contents) {
     return null;
   }
 }
-
 
 // Helper robusto para extraer JSON desde la respuesta de la IA
 function extractJsonFromText(raw) {
@@ -129,6 +125,9 @@ function pushTurn(threadId, role, text) {
   while (thread.length > MAX_TURNS) thread.shift();
 }
 
+// ------------------------------
+// Rutas para threads (rename/delete en Supabase)
+// ------------------------------
 app.post("/api/threads/rename", requireSupabaseUser, async (req, res) => {
   try {
     const { threadId, name } = req.body || {};
@@ -189,7 +188,6 @@ app.post("/api/threads/delete", requireSupabaseUser, async (req, res) => {
     res.status(500).json({ error: "No pude borrar la conversación." });
   }
 });
-
 
 // ------------------------------
 // Sistema / Prompt de Oppi
@@ -648,8 +646,6 @@ async function updateConversationSummary(conversationId) {
 // ------------------------------
 
 // CHAT — ahora ligado a Supabase por cuenta + resumen por conversación
-// CHAT
-// CHAT
 app.post("/chat-oppi", requireSupabaseUser, async (req, res) => {
   try {
     const { message, threadId } = req.body || {};
@@ -700,8 +696,6 @@ app.post("/chat-oppi", requireSupabaseUser, async (req, res) => {
     res.status(500).json({ error: "Error al generar respuesta." });
   }
 });
-
-
 
 // RESET hilo — limpia RAM y mensajes/summary en DB de ese thread
 app.post("/reset-thread", requireSupabaseUser, async (req, res) => {
@@ -754,8 +748,8 @@ function buildSimpleSummary(history) {
 
   // Nos quedamos con los mensajes del usuario
   const userMsgs = history
-    .filter(m => m.role === "user")
-    .map(m => m.text);
+    .filter((m) => m.role === "user")
+    .map((m) => m.text);
 
   if (!userMsgs.length) return null;
 
@@ -772,7 +766,7 @@ async function saveThreadSnapshot({ userId, threadId }) {
     // Últimos 3 mensajes (user/model) para mostrar rápido
     const lastMessages = history.slice(-3);
 
-    // Buscamos el nombre del hilo desde el frontend (si no, uno genérico)
+    // Nombre del hilo (si quisieras podrías recibirlo del frontend)
     const name = `Conversación Oppi`;
 
     const { error } = await supabaseAdmin
@@ -796,7 +790,6 @@ async function saveThreadSnapshot({ userId, threadId }) {
     console.error("❌ saveThreadSnapshot error:", err);
   }
 }
-
 
 // IMPORTAR .ini
 const upload = multer({
@@ -843,7 +836,9 @@ app.post("/generate-ini-ai", requireSupabaseUser, async (req, res) => {
     const history = getThread(threadId);
     let profileContext = "";
     if (profiles.has(threadId))
-      profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(threadId).summary}\n`;
+      profileContext = `\n\n[Contexto de perfil importado]\n${profiles.get(
+        threadId
+      ).summary}\n`;
 
     const schemaList = PARAM_KEYS.map((k) => `"${k}"`).join(", ");
     const askJson = `
@@ -1038,5 +1033,3 @@ server.on("error", (err) => {
   console.error("❌ No se pudo iniciar el servidor:", err);
   process.exit(1);
 });
-
-
